@@ -6,6 +6,7 @@
 #include <atomic>
 #include <string>
 #include "driver/jpeg_decode.h"
+#include "driver/ppa.h"
 #include "lvgl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -61,6 +62,9 @@ class MjpegLvgl : public Component {
   std::atomic<int> gotowy_{-1};      // indeks bufora z kompletna klatka
   int wypelniany_{0};
   jpeg_decoder_handle_t dekoder_{nullptr};
+  ppa_client_handle_t ppa_{nullptr};   // sprzetowe skalowanie do docelowego rozmiaru
+  uint8_t *dekod_buf_{nullptr};        // obraz w rozmiarze zrodlowym, przed skalowaniem
+  size_t dekod_rozmiar_{0};
   QueueHandle_t kolejka_{nullptr};   // adresy do pobrania w trybie pojedynczym
   bool tryb_strumienia_{false};
   lv_image_dsc_t opis_{};

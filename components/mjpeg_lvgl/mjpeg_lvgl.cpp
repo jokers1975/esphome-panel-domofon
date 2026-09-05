@@ -5,6 +5,7 @@
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
 #include "driver/jpeg_decode.h"
+#include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
@@ -75,7 +76,25 @@ bool MjpegLvgl::przygotuj_dekoder() {
     }
     this->rgb_rozmiar_ = przydzielono;
   }
-  ESP_LOGCONFIG(TAG, "Dekoder sprzetowy gotowy, 2 bufory po %u B", (unsigned) this->rgb_rozmiar_);
+  // Bufor na obraz w rozmiarze zrodlowym; z niego PPA skaluje do docelowego.
+  size_t przydzielono = 0;
+  this->dekod_buf_ = static_cast<uint8_t *>(jpeg_alloc_decoder_mem(potrzeba, &mem, &przydzielono));
+  if (this->dekod_buf_ == nullptr) {
+    ESP_LOGE(TAG, "Brak pamieci na bufor dekodowania");
+    return false;
+  }
+  this->dekod_rozmiar_ = przydzielono;
+
+  ppa_client_config_t ppa_cfg = {};
+  ppa_cfg.oper_type = PPA_OPERATION_SRM;
+  ppa_cfg.max_pending_trans_num = 1;
+  if (ppa_register_client(&ppa_cfg, &this->ppa_) != ESP_OK) {
+    ESP_LOGE(TAG, "Nie udalo sie zarejestrowac klienta PPA");
+    return false;
+  }
+
+  ESP_LOGCONFIG(TAG, "Dekoder sprzetowy gotowy, 2 bufory po %u B + skalowanie PPA",
+                (unsigned) this->rgb_rozmiar_);
   return true;
 }
 
@@ -113,18 +132,45 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   cfg.rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR;   // LVGL pracuje na BGR565
   uint32_t wynik = 0;
   esp_err_t err = jpeg_decoder_process(this->dekoder_, &cfg, this->jpeg_buf_, dlugosc,
-                                       this->rgb_[this->wypelniany_], this->rgb_rozmiar_, &wynik);
+                                       this->dekod_buf_, this->dekod_rozmiar_, &wynik);
   if (err != ESP_OK) {
     this->bledow_.fetch_add(1);
     return false;
   }
-  this->opis_.header.w = info.width;
-  this->opis_.header.h = info.height;
-  this->opis_.header.stride = szer_wyr * 2;
-  this->opis_.data_size = szer_wyr * wys_wyr * 2;
+
+  // Skalowanie sprzetowe do rozmiaru docelowego. LVGL dostaje obraz gotowy,
+  // dzieki czemu nie uruchamia swojego programowego przeksztalcenia — to ono
+  // kosztowalo 200-400 ms na kazde narysowanie okladki.
+  ppa_srm_oper_config_t srm = {};
+  srm.in.buffer = this->dekod_buf_;
+  srm.in.pic_w = szer_wyr;
+  srm.in.pic_h = wys_wyr;
+  srm.in.block_w = info.width;
+  srm.in.block_h = info.height;
+  srm.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  srm.out.buffer = this->rgb_[this->wypelniany_];
+  srm.out.buffer_size = this->rgb_rozmiar_;
+  srm.out.pic_w = this->width_;
+  srm.out.pic_h = this->height_;
+  srm.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+  srm.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+  srm.scale_x = static_cast<float>(this->width_) / info.width;
+  srm.scale_y = static_cast<float>(this->height_) / info.height;
+  srm.mode = PPA_TRANS_MODE_BLOCKING;
+  if (ppa_do_scale_rotate_mirror(this->ppa_, &srm) != ESP_OK) {
+    ESP_LOGW(TAG, "Skalowanie PPA nieudane (%ux%u -> %ux%u)", (unsigned) info.width,
+             (unsigned) info.height, this->width_, this->height_);
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+
+  this->opis_.header.w = this->width_;
+  this->opis_.header.h = this->height_;
+  this->opis_.header.stride = this->width_ * 2;
+  this->opis_.data_size = static_cast<uint32_t>(this->width_) * this->height_ * 2;
   if (this->zdekodowanych_.load() == 0 || szer_wyr != this->ost_szer_) {
-    ESP_LOGI(TAG, "Obraz %ux%u, blok %ux%u, wiersz %u B", (unsigned) info.width,
-             (unsigned) info.height, mcu_w, mcu_h, (unsigned) szer_wyr * 2);
+    ESP_LOGI(TAG, "Obraz %ux%u -> %ux%u (blok %ux%u)", (unsigned) info.width,
+             (unsigned) info.height, this->width_, this->height_, mcu_w, mcu_h);
     this->ost_szer_ = szer_wyr;
   }
   // Odslon wypelniony bufor i przelacz sie na drugi.
