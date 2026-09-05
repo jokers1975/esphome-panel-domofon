@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
+#include <string>
 
 namespace esphome {
 namespace mjpeg_lvgl {
@@ -39,6 +40,16 @@ void MjpegLvgl::setup() {
   this->opis_.header.stride = this->width_ * 2;
   this->opis_.data_size = this->rgb_rozmiar_;
   this->opis_.data = this->rgb_[0];
+
+  this->tryb_strumienia_ = !this->url_.empty();
+  if (!this->tryb_strumienia_) {
+    this->kolejka_ = xQueueCreate(1, sizeof(std::string *));
+    this->biegnie_.store(true);
+    xTaskCreatePinnedToCore(MjpegLvgl::task_trampoline, "jpeg1", 6144, this,
+                            tskIDLE_PRIORITY + 2,
+                            reinterpret_cast<TaskHandle_t *>(&this->task_handle_), 1);
+    ESP_LOGCONFIG(TAG, "Tryb pojedynczych obrazow");
+  }
 }
 
 bool MjpegLvgl::przygotuj_dekoder() {
@@ -69,7 +80,20 @@ bool MjpegLvgl::przygotuj_dekoder() {
 }
 
 // Wolane z zadania strumienia — dekodowanie nie moze isc w glownej petli.
-void MjpegLvgl::dekoduj(uint32_t dlugosc) {
+bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
+  // Okladki plyt przychodza w roznych rozmiarach, wiec wymiary czytamy
+  // z naglowka kazdej ramki zamiast ufac konfiguracji.
+  jpeg_decode_picture_info_t info = {};
+  if (jpeg_decoder_get_info(this->jpeg_buf_, dlugosc, &info) != ESP_OK) {
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+  if (static_cast<size_t>(info.width) * info.height * 2 > this->rgb_rozmiar_) {
+    ESP_LOGW(TAG, "Obraz %ux%u nie miesci sie w buforze", (unsigned) info.width, (unsigned) info.height);
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+
   jpeg_decode_cfg_t cfg = {};
   cfg.output_format = JPEG_DECODE_OUT_FORMAT_RGB565;
   cfg.rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR;   // LVGL pracuje na BGR565
@@ -78,12 +102,73 @@ void MjpegLvgl::dekoduj(uint32_t dlugosc) {
                                        this->rgb_[this->wypelniany_], this->rgb_rozmiar_, &wynik);
   if (err != ESP_OK) {
     this->bledow_.fetch_add(1);
-    return;
+    return false;
   }
+  this->opis_.header.w = info.width;
+  this->opis_.header.h = info.height;
+  this->opis_.header.stride = info.width * 2;
+  this->opis_.data_size = static_cast<uint32_t>(info.width) * info.height * 2;
   // Odslon wypelniony bufor i przelacz sie na drugi.
   this->gotowy_.store(this->wypelniany_);
   this->wypelniany_ = 1 - this->wypelniany_;
   this->zdekodowanych_.fetch_add(1);
+  return true;
+}
+
+// Tryb pojedynczych obrazow: adres trafia do kolejki o glebokosci 1.
+// Nowsze zlecenie nadpisuje starsze — przy szybkiej zmianie utworow liczy
+// sie ostatnia okladka, nie wszystkie po drodze.
+void MjpegLvgl::pobierz(const std::string &url) {
+  if (this->kolejka_ == nullptr || url.empty())
+    return;
+  auto *kopia = new std::string(url);
+  std::string *stary = nullptr;
+  if (xQueueReceive(this->kolejka_, &stary, 0) == pdTRUE)
+    delete stary;
+  if (xQueueSend(this->kolejka_, &kopia, 0) != pdTRUE)
+    delete kopia;
+}
+
+bool MjpegLvgl::pobierz_jeden(const std::string &url) {
+  esp_http_client_config_t cfg = {};
+  cfg.url = url.c_str();
+  cfg.timeout_ms = 8000;
+  cfg.buffer_size = 4096;
+  esp_http_client_handle_t klient = esp_http_client_init(&cfg);
+  if (klient == nullptr)
+    return false;
+
+  bool ok = false;
+  if (esp_http_client_open(klient, 0) == ESP_OK) {
+    esp_http_client_fetch_headers(klient);
+    if (esp_http_client_get_status_code(klient) == 200) {
+      uint32_t dl = 0;
+      while (true) {
+        int n = esp_http_client_read(klient, reinterpret_cast<char *>(this->jpeg_buf_ + dl),
+                                     this->buffer_size_ - dl);
+        if (n <= 0)
+          break;
+        dl += n;
+        if (dl >= this->buffer_size_) {
+          ESP_LOGW(TAG, "Obraz wiekszy niz bufor (%u B)", this->buffer_size_);
+          dl = 0;
+          break;
+        }
+      }
+      if (dl > 4) {
+        this->ramek_.fetch_add(1);
+        this->ostatnia_dl_.store(dl);
+        ok = this->dekoduj(dl);
+      }
+    } else {
+      ESP_LOGW(TAG, "Obraz: HTTP %d", esp_http_client_get_status_code(klient));
+    }
+  } else {
+    ESP_LOGW(TAG, "Obraz: polaczenie nieudane (%s)", url.c_str());
+  }
+  esp_http_client_close(klient);
+  esp_http_client_cleanup(klient);
+  return ok;
 }
 
 bool MjpegLvgl::nowa_klatka() {
@@ -122,6 +207,16 @@ void MjpegLvgl::task_trampoline(void *arg) {
 }
 
 void MjpegLvgl::task_loop() {
+  if (!this->tryb_strumienia_) {
+    // Tryb pojedynczych obrazow: zadanie zyje caly czas i czeka na zlecenia.
+    while (true) {
+      std::string *url = nullptr;
+      if (xQueueReceive(this->kolejka_, &url, portMAX_DELAY) == pdTRUE && url != nullptr) {
+        this->pobierz_jeden(*url);
+        delete url;
+      }
+    }
+  }
   while (this->biegnie_.load()) {
     if (!this->czytaj_strumien())
       vTaskDelay(pdMS_TO_TICKS(1000));   // po bledzie odczekaj przed ponowieniem

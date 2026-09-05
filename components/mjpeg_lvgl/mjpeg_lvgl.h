@@ -7,12 +7,17 @@
 #include <string>
 #include "driver/jpeg_decode.h"
 #include "lvgl.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 namespace esphome {
 namespace mjpeg_lvgl {
 
-// Etap 1: pobieranie strumienia MJPEG we wlasnym zadaniu i rozbior ramek.
-// Dekodowanie sprzetowe i przekazanie do LVGL dochodza w kolejnych etapach.
+// Pobieranie i sprzetowe dekodowanie JPEG poza glowna petla ESPHome.
+// Dwa tryby, zaleznie od tego, czy w konfiguracji podano "url":
+//   - strumien: ciagly MJPEG (kamera domofonu),
+//   - pojedyncze obrazy: adres podawany w locie przez pobierz() (okladki plyt).
+// Glowna petla dostaje wylacznie gotowy wskaznik — LVGL nie jest watkowo bezpieczne.
 class MjpegLvgl : public Component {
  public:
   void setup() override;
@@ -27,6 +32,8 @@ class MjpegLvgl : public Component {
 
   void start_stream();
   void stop_stream();
+  // Tryb pojedynczych obrazow: zleca pobranie i zdekodowanie jednego JPEG.
+  void pobierz(const std::string &url);
 
   // Wolane z glownej petli: czy czeka nowa zdekodowana klatka.
   bool nowa_klatka();
@@ -45,7 +52,8 @@ class MjpegLvgl : public Component {
   uint32_t buffer_size_{131072};
 
   bool przygotuj_dekoder();
-  void dekoduj(uint32_t dlugosc);
+  bool dekoduj(uint32_t dlugosc);
+  bool pobierz_jeden(const std::string &url);
 
   uint8_t *jpeg_buf_{nullptr};       // surowa ramka JPEG (PSRAM)
   uint8_t *rgb_[2]{nullptr, nullptr};  // dwa bufory RGB565: rysowany i wypelniany
@@ -53,6 +61,8 @@ class MjpegLvgl : public Component {
   std::atomic<int> gotowy_{-1};      // indeks bufora z kompletna klatka
   int wypelniany_{0};
   jpeg_decoder_handle_t dekoder_{nullptr};
+  QueueHandle_t kolejka_{nullptr};   // adresy do pobrania w trybie pojedynczym
+  bool tryb_strumienia_{false};
   lv_image_dsc_t opis_{};
   std::atomic<uint32_t> zdekodowanych_{0};
   void *task_handle_{nullptr};

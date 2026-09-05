@@ -28,11 +28,14 @@ def _tylko_p4(config):
     return config
 
 
-CONFIG_SCHEMA = cv.All(
+# Komponent moze miec kilka instancji: osobna na strumien z kamery i osobna
+# na okladki plyt, kazda z wlasnym zadaniem i wlasnymi buforami.
+_INSTANCJA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(MjpegLvgl),
-            cv.Required(CONF_URL): cv.string,
+            # bez url komponent dziala w trybie pojedynczych obrazow (pobierz())
+            cv.Optional(CONF_URL, default=""): cv.string,
             cv.Required(CONF_WIDTH): cv.int_range(16, 1280),
             cv.Required(CONF_HEIGHT): cv.int_range(16, 1280),
             cv.Optional(CONF_FPS, default=10): cv.int_range(1, 30),
@@ -43,13 +46,16 @@ CONFIG_SCHEMA = cv.All(
     _tylko_p4,
 )
 
+CONFIG_SCHEMA = cv.ensure_list(_INSTANCJA)
+
 
 async def to_code(config):
-    var = cg.new_Pvariable(config[CONF_ID])
-    await cg.register_component(var, config)
-    cg.add(var.set_url(config[CONF_URL]))
-    cg.add(var.set_size(config[CONF_WIDTH], config[CONF_HEIGHT]))
-    cg.add(var.set_fps(config[CONF_FPS]))
-    cg.add(var.set_buffer_size(config[CONF_BUFFER_SIZE]))
+    for conf in config:
+        var = cg.new_Pvariable(conf[CONF_ID])
+        await cg.register_component(var, conf)
+        cg.add(var.set_url(conf[CONF_URL]))
+        cg.add(var.set_size(conf[CONF_WIDTH], conf[CONF_HEIGHT]))
+        cg.add(var.set_fps(conf[CONF_FPS]))
+        cg.add(var.set_buffer_size(conf[CONF_BUFFER_SIZE]))
     # sprzetowy dekoder JPEG i akcelerator PPA z ESP-IDF
     cg.add_build_flag("-DMJPEG_LVGL")
