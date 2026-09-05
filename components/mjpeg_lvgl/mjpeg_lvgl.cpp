@@ -68,48 +68,70 @@ bool MjpegLvgl::czytaj_strumien() {
   cfg.timeout_ms = 8000;
   cfg.buffer_size = 4096;
   esp_http_client_handle_t klient = esp_http_client_init(&cfg);
-  if (klient == nullptr)
+  if (klient == nullptr) {
+    ESP_LOGE(TAG, "Nie udalo sie utworzyc klienta HTTP");
     return false;
+  }
 
-  bool ok = false;
-  if (esp_http_client_open(klient, 0) == ESP_OK) {
-    esp_http_client_fetch_headers(klient);
-    uint8_t kawalek[2048];
-    uint32_t dl = 0;
-    bool w_ramce = false;
-    ok = true;
-    while (this->biegnie_.load()) {
-      int n = esp_http_client_read(klient, reinterpret_cast<char *>(kawalek), sizeof(kawalek));
-      if (n <= 0)
-        break;
-      for (int i = 0; i < n; i++) {
-        uint8_t b = kawalek[i];
-        if (!w_ramce) {
-          if (b == 0xD8 && i > 0 && kawalek[i - 1] == 0xFF) {
-            w_ramce = true;
-            dl = 0;
-            this->jpeg_buf_[dl++] = 0xFF;
-            this->jpeg_buf_[dl++] = 0xD8;
-          }
-          continue;
+  esp_err_t err = esp_http_client_open(klient, 0);
+  if (err != ESP_OK) {
+    // Brak tego logu kosztowal jedna runde diagnostyki: komponent milczal,
+    // a licznik klatek stal na zerze bez zadnej wskazowki dlaczego.
+    ESP_LOGW(TAG, "Polaczenie nieudane: %s (%s)", esp_err_to_name(err), this->url_.c_str());
+    esp_http_client_cleanup(klient);
+    return false;
+  }
+
+  const int dl_naglowkow = esp_http_client_fetch_headers(klient);
+  const int status = esp_http_client_get_status_code(klient);
+  ESP_LOGI(TAG, "Polaczono, HTTP %d, dlugosc %d", status, dl_naglowkow);
+  if (status != 200) {
+    ESP_LOGW(TAG, "Serwer odpowiedzial %d — przerywam", status);
+    esp_http_client_close(klient);
+    esp_http_client_cleanup(klient);
+    return false;
+  }
+
+  uint8_t kawalek[2048];
+  uint32_t dl = 0;
+  bool w_ramce = false;
+  uint8_t poprzedni = 0;       // ostatni bajt z poprzedniej porcji: znacznik
+                               // FFD8 potrafi wypasc na styku dwoch odczytow
+  uint32_t bajtow = 0;
+  while (this->biegnie_.load()) {
+    int n = esp_http_client_read(klient, reinterpret_cast<char *>(kawalek), sizeof(kawalek));
+    if (n <= 0) {
+      ESP_LOGW(TAG, "Strumien przerwany po %u B", bajtow);
+      break;
+    }
+    bajtow += n;
+    for (int i = 0; i < n; i++) {
+      const uint8_t b = kawalek[i];
+      if (!w_ramce) {
+        if (b == 0xD8 && poprzedni == 0xFF) {
+          w_ramce = true;
+          dl = 0;
+          this->jpeg_buf_[dl++] = 0xFF;
+          this->jpeg_buf_[dl++] = 0xD8;
         }
-        if (dl >= this->buffer_size_) {   // ramka wieksza niz bufor — odrzuc
-          w_ramce = false;
-          this->bledow_.fetch_add(1);
-          continue;
-        }
+      } else if (dl >= this->buffer_size_) {
+        w_ramce = false;                       // ramka nie miesci sie w buforze
+        this->bledow_.fetch_add(1);
+      } else {
         this->jpeg_buf_[dl++] = b;
-        if (b == 0xD9 && dl >= 2 && this->jpeg_buf_[dl - 2] == 0xFF) {
+        if (b == 0xD9 && poprzedni == 0xFF) {
           w_ramce = false;
+          this->ostatnia_dl_.store(dl);
           this->ramek_.fetch_add(1);
           // TODO etap 2: sprzetowe dekodowanie jpeg_buf_[0..dl) do RGB565
         }
       }
+      poprzedni = b;
     }
   }
   esp_http_client_close(klient);
   esp_http_client_cleanup(klient);
-  return ok;
+  return true;
 }
 
 void MjpegLvgl::loop() {
@@ -117,7 +139,10 @@ void MjpegLvgl::loop() {
   const uint32_t teraz = millis();
   if (this->biegnie_.load() && teraz - this->ostatni_raport_ > 5000) {
     this->ostatni_raport_ = teraz;
-    ESP_LOGI(TAG, "ramek: %u, odrzuconych: %u", this->ramek_.load(), this->bledow_.load());
+    const uint32_t n = this->ramek_.load();
+    ESP_LOGI(TAG, "ramek: %u (%.1f/s), ostatnia %u B, odrzuconych: %u", n,
+             (n - this->poprzednio_) / 5.0f, this->ostatnia_dl_.load(), this->bledow_.load());
+    this->poprzednio_ = n;
   }
 }
 

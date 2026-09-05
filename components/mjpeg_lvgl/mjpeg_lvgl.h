@@ -42,6 +42,8 @@ class MjpegLvgl : public Component {
   std::atomic<bool> biegnie_{false};
   std::atomic<uint32_t> ramek_{0};   // licznik odebranych ramek
   std::atomic<uint32_t> bledow_{0};
+  std::atomic<uint32_t> ostatnia_dl_{0};  // rozmiar ostatniej ramki
+  uint32_t poprzednio_{0};                // licznik z poprzedniego raportu
   uint32_t ostatni_raport_{0};
 };
 
