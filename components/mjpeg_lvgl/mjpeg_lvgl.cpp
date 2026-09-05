@@ -4,6 +4,7 @@
 #include "esphome/core/log.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
+#include "driver/jpeg_decode.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <cstring>
@@ -23,6 +24,74 @@ void MjpegLvgl::setup() {
     return;
   }
   ESP_LOGCONFIG(TAG, "Bufor ramki: %u B w PSRAM", this->buffer_size_);
+
+  if (!this->przygotuj_dekoder()) {
+    this->mark_failed();
+    return;
+  }
+
+  // Opis obrazu dla LVGL wypelniamy raz — potem zmienia sie tylko wskaznik
+  // na dane, gdy odslaniamy swiezo zdekodowana klatke.
+  this->opis_.header.magic = LV_IMAGE_HEADER_MAGIC;
+  this->opis_.header.cf = LV_COLOR_FORMAT_RGB565;
+  this->opis_.header.w = this->width_;
+  this->opis_.header.h = this->height_;
+  this->opis_.header.stride = this->width_ * 2;
+  this->opis_.data_size = this->rgb_rozmiar_;
+  this->opis_.data = this->rgb_[0];
+}
+
+bool MjpegLvgl::przygotuj_dekoder() {
+  jpeg_decode_engine_cfg_t cfg = {};
+  cfg.intr_priority = 0;
+  cfg.timeout_ms = 120;     // przy 15 kl/s na ramke jest ok. 66 ms
+  esp_err_t err = jpeg_new_decoder_engine(&cfg, &this->dekoder_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Nie udalo sie uruchomic sprzetowego dekodera JPEG: %s", esp_err_to_name(err));
+    return false;
+  }
+
+  // Bufory wyjsciowe musi przydzielic sterownik — wymaga wyrownania pod DMA.
+  jpeg_decode_memory_alloc_cfg_t mem = {};
+  mem.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
+  const size_t potrzeba = static_cast<size_t>(this->width_) * this->height_ * 2;
+  for (int i = 0; i < 2; i++) {
+    size_t przydzielono = 0;
+    this->rgb_[i] = static_cast<uint8_t *>(jpeg_alloc_decoder_mem(potrzeba, &mem, &przydzielono));
+    if (this->rgb_[i] == nullptr) {
+      ESP_LOGE(TAG, "Brak pamieci na bufor obrazu %d (%u B)", i, (unsigned) potrzeba);
+      return false;
+    }
+    this->rgb_rozmiar_ = przydzielono;
+  }
+  ESP_LOGCONFIG(TAG, "Dekoder sprzetowy gotowy, 2 bufory po %u B", (unsigned) this->rgb_rozmiar_);
+  return true;
+}
+
+// Wolane z zadania strumienia — dekodowanie nie moze isc w glownej petli.
+void MjpegLvgl::dekoduj(uint32_t dlugosc) {
+  jpeg_decode_cfg_t cfg = {};
+  cfg.output_format = JPEG_DECODE_OUT_FORMAT_RGB565;
+  cfg.rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR;   // LVGL pracuje na BGR565
+  uint32_t wynik = 0;
+  esp_err_t err = jpeg_decoder_process(this->dekoder_, &cfg, this->jpeg_buf_, dlugosc,
+                                       this->rgb_[this->wypelniany_], this->rgb_rozmiar_, &wynik);
+  if (err != ESP_OK) {
+    this->bledow_.fetch_add(1);
+    return;
+  }
+  // Odslon wypelniony bufor i przelacz sie na drugi.
+  this->gotowy_.store(this->wypelniany_);
+  this->wypelniany_ = 1 - this->wypelniany_;
+  this->zdekodowanych_.fetch_add(1);
+}
+
+bool MjpegLvgl::nowa_klatka() {
+  const int i = this->gotowy_.exchange(-1);
+  if (i < 0)
+    return false;
+  this->opis_.data = this->rgb_[i];
+  return true;
 }
 
 void MjpegLvgl::dump_config() {
@@ -123,7 +192,7 @@ bool MjpegLvgl::czytaj_strumien() {
           w_ramce = false;
           this->ostatnia_dl_.store(dl);
           this->ramek_.fetch_add(1);
-          // TODO etap 2: sprzetowe dekodowanie jpeg_buf_[0..dl) do RGB565
+          this->dekoduj(dl);
         }
       }
       poprzedni = b;
@@ -142,6 +211,7 @@ void MjpegLvgl::loop() {
     const uint32_t n = this->ramek_.load();
     ESP_LOGI(TAG, "ramek: %u (%.1f/s), ostatnia %u B, odrzuconych: %u", n,
              (n - this->poprzednio_) / 5.0f, this->ostatnia_dl_.load(), this->bledow_.load());
+    ESP_LOGI(TAG, "zdekodowanych: %u", this->zdekodowanych_.load());
     this->poprzednio_ = n;
   }
 }

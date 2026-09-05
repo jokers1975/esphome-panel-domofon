@@ -10,7 +10,7 @@ import esphome.config_validation as cv
 from esphome.const import CONF_ID, CONF_URL, CONF_WIDTH, CONF_HEIGHT
 
 CODEOWNERS = ["@mariuszczarnasiak"]
-DEPENDENCIES = ["esp32"]
+DEPENDENCIES = ["esp32", "lvgl"]
 
 CONF_FPS = "fps"
 CONF_BUFFER_SIZE = "buffer_size"

@@ -5,6 +5,8 @@
 #include "esphome/core/helpers.h"
 #include <atomic>
 #include <string>
+#include "driver/jpeg_decode.h"
+#include "lvgl.h"
 
 namespace esphome {
 namespace mjpeg_lvgl {
@@ -26,6 +28,11 @@ class MjpegLvgl : public Component {
   void start_stream();
   void stop_stream();
 
+  // Wolane z glownej petli: czy czeka nowa zdekodowana klatka.
+  bool nowa_klatka();
+  // Opis obrazu dla LVGL. Wskazuje na bufor, ktory wlasnie zostal odslonięty.
+  const lv_image_dsc_t *opis_obrazu() const { return &this->opis_; }
+
  protected:
   static void task_trampoline(void *arg);
   void task_loop();
@@ -37,7 +44,17 @@ class MjpegLvgl : public Component {
   uint8_t fps_{10};
   uint32_t buffer_size_{131072};
 
+  bool przygotuj_dekoder();
+  void dekoduj(uint32_t dlugosc);
+
   uint8_t *jpeg_buf_{nullptr};       // surowa ramka JPEG (PSRAM)
+  uint8_t *rgb_[2]{nullptr, nullptr};  // dwa bufory RGB565: rysowany i wypelniany
+  size_t rgb_rozmiar_{0};
+  std::atomic<int> gotowy_{-1};      // indeks bufora z kompletna klatka
+  int wypelniany_{0};
+  jpeg_decoder_handle_t dekoder_{nullptr};
+  lv_image_dsc_t opis_{};
+  std::atomic<uint32_t> zdekodowanych_{0};
   void *task_handle_{nullptr};
   std::atomic<bool> biegnie_{false};
   std::atomic<uint32_t> ramek_{0};   // licznik odebranych ramek
