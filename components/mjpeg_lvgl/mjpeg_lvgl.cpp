@@ -88,8 +88,22 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
     this->bledow_.fetch_add(1);
     return false;
   }
-  if (static_cast<size_t>(info.width) * info.height * 2 > this->rgb_rozmiar_) {
-    ESP_LOGW(TAG, "Obraz %ux%u nie miesci sie w buforze", (unsigned) info.width, (unsigned) info.height);
+  // Sterownik zapisuje obraz o wymiarach WYROWNANYCH do bloku MCU, nie o
+  // rzeczywistych. Przy szerokosci niebedacej wielokrotnoscia bloku wiersze sa
+  // dluzsze, niz wynika z naglowka — LVGL musi dostac te dluzsza wartosc jako
+  // stride, inaczej obraz rozjezdza sie w pionowe pasy.
+  uint16_t mcu_w = 8, mcu_h = 8;
+  switch (info.sample_method) {
+    case JPEG_DOWN_SAMPLING_YUV420: mcu_w = 16; mcu_h = 16; break;
+    case JPEG_DOWN_SAMPLING_YUV422: mcu_w = 16; mcu_h = 8;  break;
+    default: break;
+  }
+  const uint32_t szer_wyr = (info.width + mcu_w - 1) / mcu_w * mcu_w;
+  const uint32_t wys_wyr = (info.height + mcu_h - 1) / mcu_h * mcu_h;
+
+  if (static_cast<size_t>(szer_wyr) * wys_wyr * 2 > this->rgb_rozmiar_) {
+    ESP_LOGW(TAG, "Obraz %ux%u (wyrownany %ux%u) nie miesci sie w buforze",
+             (unsigned) info.width, (unsigned) info.height, (unsigned) szer_wyr, (unsigned) wys_wyr);
     this->bledow_.fetch_add(1);
     return false;
   }
@@ -106,8 +120,13 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   }
   this->opis_.header.w = info.width;
   this->opis_.header.h = info.height;
-  this->opis_.header.stride = info.width * 2;
-  this->opis_.data_size = static_cast<uint32_t>(info.width) * info.height * 2;
+  this->opis_.header.stride = szer_wyr * 2;
+  this->opis_.data_size = szer_wyr * wys_wyr * 2;
+  if (this->zdekodowanych_.load() == 0 || szer_wyr != this->ost_szer_) {
+    ESP_LOGI(TAG, "Obraz %ux%u, blok %ux%u, wiersz %u B", (unsigned) info.width,
+             (unsigned) info.height, mcu_w, mcu_h, (unsigned) szer_wyr * 2);
+    this->ost_szer_ = szer_wyr;
+  }
   // Odslon wypelniony bufor i przelacz sie na drugi.
   this->gotowy_.store(this->wypelniany_);
   this->wypelniany_ = 1 - this->wypelniany_;

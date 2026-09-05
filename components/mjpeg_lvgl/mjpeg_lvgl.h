@@ -65,6 +65,7 @@ class MjpegLvgl : public Component {
   bool tryb_strumienia_{false};
   lv_image_dsc_t opis_{};
   std::atomic<uint32_t> zdekodowanych_{0};
+  uint32_t ost_szer_{0};   // ostatnia wyrownana szerokosc — do logu przy zmianie
   void *task_handle_{nullptr};
   std::atomic<bool> biegnie_{false};
   std::atomic<uint32_t> ramek_{0};   // licznik odebranych ramek
