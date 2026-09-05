@@ -241,6 +241,24 @@ void GSL3680::update_touches() {
 //  - w trakcie dotkniecia pojedynczy skok pomijamy, a ruch przyjmujemy dopiero
 //    gdy potwierdzi go kolejna probka (przeciaganie traci najwyzej jedna probke).
 void GSL3680::zglos_probke_(int16_t x, int16_t y, uint8_t palcow) {
+    uint32_t teraz = millis();
+    uint32_t przerwa = teraz - this->ost_ms_;
+    this->ost_ms_ = teraz;
+
+    if (this->diagnostyka_) {
+        ESP_LOGI(TAG, "probka palcow=%u %dx%d (przerwa %u ms)", palcow, x, y, przerwa);
+    }
+
+    // Zabezpieczenie: jesli kontroler nie zglosil podniesienia palca (brak
+    // przerwania i brak odpytania), stan potrafil przetrwac sekundy i kolejne
+    // dotkniecie bylo brane za ciag dalszy poprzedniego. Dluga przerwa zawsze
+    // zaczyna nowe dotkniecie.
+    if (przerwa > 300) {
+        this->dotyk_aktywny_ = false;
+        this->kandydat_ = false;
+        this->skok_ = false;
+    }
+
     if (palcow != 1) {
         this->dotyk_aktywny_ = false;
         this->kandydat_ = false;

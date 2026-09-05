@@ -30,6 +30,7 @@ class GSL3680 : public touchscreen::Touchscreen, public i2c::I2CDevice {
         void set_interrupt_pin(InternalGPIOPin *pin) { this->interrupt_pin_ = pin; }
         void set_prog_potwierdzenia(uint16_t v) { this->prog_potwierdzenia_ = v; }
         void set_prog_skoku(uint16_t v) { this->prog_skoku_ = v; }
+        void set_diagnostyka(bool v) { this->diagnostyka_ = v; }
         void set_reset_pin(InternalGPIOPin *pin) { this->reset_pin_ = pin; }
 
     protected:
@@ -39,6 +40,8 @@ class GSL3680 : public touchscreen::Touchscreen, public i2c::I2CDevice {
         void zglos_probke_(int16_t x, int16_t y, uint8_t palcow);
         uint16_t prog_potwierdzenia_{40};
         uint16_t prog_skoku_{150};
+        bool diagnostyka_{false};
+        uint32_t ost_ms_{0};
         bool dotyk_aktywny_{false};
         bool kandydat_{false};
         bool skok_{false};
