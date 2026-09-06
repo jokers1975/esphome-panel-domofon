@@ -232,6 +232,10 @@ bool MjpegLvgl::pobierz_jeden(const std::string &url) {
         this->ramek_.fetch_add(1);
         this->ostatnia_dl_.store(dl);
         ok = this->dekoduj(dl);
+        // Rozmiar w logu pozwala odroznic dwa przypadki nieaktualnej okladki:
+        // nieudane pobranie (widac ostrzezenie) od poprawnego pobrania starego
+        // obrazka z posrednika Home Assistanta (ten sam rozmiar co poprzednio).
+        ESP_LOGI(TAG, "Okladka pobrana: %u B, dekodowanie %s", (unsigned) dl, ok ? "ok" : "NIEUDANE");
       }
     } else {
       ESP_LOGW(TAG, "Obraz: HTTP %d", esp_http_client_get_status_code(klient));
@@ -285,7 +289,22 @@ void MjpegLvgl::task_loop() {
     while (true) {
       std::string *url = nullptr;
       if (xQueueReceive(this->kolejka_, &url, portMAX_DELAY) == pdTRUE && url != nullptr) {
-        this->pobierz_jeden(*url);
+        // Nieudane pobranie zostawialo na ekranie okladke z poprzedniego utworu,
+        // bo tytul i wykonawca ida wlasnym torem i aktualizuja sie mimo to.
+        // Wynik nie moze byc odrzucany — probujemy ponownie z narastajaca przerwa.
+        static const uint16_t przerwy[] = {400, 1200, 3000};
+        bool ok = false;
+        for (int proba = 0; proba < 4 && !ok; proba++) {
+          if (proba > 0) {
+            // Nowsze zlecenie uniewaznia ponawianie — nie nadpisujmy go stara okladka.
+            if (uxQueueMessagesWaiting(this->kolejka_) > 0)
+              break;
+            vTaskDelay(pdMS_TO_TICKS(przerwy[proba - 1]));
+          }
+          ok = this->pobierz_jeden(*url);
+        }
+        if (!ok)
+          ESP_LOGW(TAG, "Nie udalo sie pobrac okladki po 4 probach: %s", url->c_str());
         delete url;
       }
     }
