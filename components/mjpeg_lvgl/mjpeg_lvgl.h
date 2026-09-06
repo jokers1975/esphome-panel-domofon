@@ -57,6 +57,8 @@ class MjpegLvgl : public Component {
   bool pobierz_jeden(const std::string &url);
 
   uint8_t *jpeg_buf_{nullptr};       // surowa ramka JPEG (PSRAM)
+  // Bufor odczytu z gniazda. Byl tablica lokalna w zadaniu — 2 kB z 6 kB stosu.
+  uint8_t *kawalek_{nullptr};
   uint8_t *rgb_[2]{nullptr, nullptr};  // dwa bufory RGB565: rysowany i wypelniany
   size_t rgb_rozmiar_{0};
   std::atomic<int> gotowy_{-1};      // indeks bufora z kompletna klatka

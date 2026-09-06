@@ -25,6 +25,14 @@ void MjpegLvgl::setup() {
     this->mark_failed();
     return;
   }
+  // Bufor odczytu z gniazda w pamieci wewnetrznej. Wczesniej byl tablica
+  // lokalna w zadaniu i zabieral 2 kB z 6 kB stosu.
+  this->kawalek_ = static_cast<uint8_t *>(heap_caps_malloc(2048, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (this->kawalek_ == nullptr) {
+    ESP_LOGE(TAG, "Brak pamieci na bufor odczytu");
+    this->mark_failed();
+    return;
+  }
   ESP_LOGCONFIG(TAG, "Bufor ramki: %u B w PSRAM", this->buffer_size_);
 
   if (!this->przygotuj_dekoder()) {
@@ -46,7 +54,7 @@ void MjpegLvgl::setup() {
   if (!this->tryb_strumienia_) {
     this->kolejka_ = xQueueCreate(1, sizeof(std::string *));
     this->biegnie_.store(true);
-    xTaskCreatePinnedToCore(MjpegLvgl::task_trampoline, "jpeg1", 6144, this,
+    xTaskCreatePinnedToCore(MjpegLvgl::task_trampoline, "jpeg1", 12288, this,
                             tskIDLE_PRIORITY + 2,
                             reinterpret_cast<TaskHandle_t *>(&this->task_handle_), 1);
     ESP_LOGCONFIG(TAG, "Tryb pojedynczych obrazow");
@@ -259,7 +267,7 @@ void MjpegLvgl::start_stream() {
   this->bledow_.store(0);
   // Wlasne zadanie: pobieranie nie moze blokowac glownej petli, bo to
   // wlasnie ono zawieszalo panel przy okladkach.
-  xTaskCreatePinnedToCore(MjpegLvgl::task_trampoline, "mjpeg", 6144, this,
+  xTaskCreatePinnedToCore(MjpegLvgl::task_trampoline, "mjpeg", 12288, this,
                           tskIDLE_PRIORITY + 2,
                           reinterpret_cast<TaskHandle_t *>(&this->task_handle_), 1);
 }
@@ -321,14 +329,14 @@ bool MjpegLvgl::czytaj_strumien() {
     return false;
   }
 
-  uint8_t kawalek[2048];
+  uint8_t *const kawalek = this->kawalek_;   // bufor skladowy, nie na stosie
   uint32_t dl = 0;
   bool w_ramce = false;
   uint8_t poprzedni = 0;       // ostatni bajt z poprzedniej porcji: znacznik
                                // FFD8 potrafi wypasc na styku dwoch odczytow
   uint32_t bajtow = 0;
   while (this->biegnie_.load()) {
-    int n = esp_http_client_read(klient, reinterpret_cast<char *>(kawalek), sizeof(kawalek));
+    int n = esp_http_client_read(klient, reinterpret_cast<char *>(kawalek), 2048);
     if (n <= 0) {
       ESP_LOGW(TAG, "Strumien przerwany po %u B", bajtow);
       break;
@@ -372,6 +380,15 @@ void MjpegLvgl::loop() {
     ESP_LOGI(TAG, "ramek: %u (%.1f/s), ostatnia %u B, odrzuconych: %u", n,
              (n - this->poprzednio_) / 5.0f, this->ostatnia_dl_.load(), this->bledow_.load());
     ESP_LOGI(TAG, "zdekodowanych: %u", this->zdekodowanych_.load());
+    // Zapas stosu zadania dekodujacego. Stos ma 12288 B; przy 6144 B i tablicy
+    // lokalnej 2048 B lancuch HTTP + dekoder + PPA podchodzil pod wartownika,
+    // a przepelnienie objawialo sie niebieskim ekranem i restartem. Ta liczba
+    // to najmniejszy zaobserwowany wolny zapas w bajtach — ma zostac wysoko.
+    if (this->task_handle_ != nullptr) {
+      const UBaseType_t zapas =
+          uxTaskGetStackHighWaterMark(reinterpret_cast<TaskHandle_t>(this->task_handle_));
+      ESP_LOGI(TAG, "zapas stosu zadania: %u B", (unsigned) (zapas * sizeof(StackType_t)));
+    }
     this->poprzednio_ = n;
   }
 }
