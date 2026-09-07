@@ -353,6 +353,16 @@ void MjpegLvgl::dump_config() {
 }
 
 void MjpegLvgl::start_stream() {
+  // Zabezpieczenie przed wywolaniem SPRZED setup(). Przywracany stan
+  // przelacznika w ESPHome wykonuje sie w trakcie konfiguracji komponentow,
+  // wiec potrafi trafic tu, zanim powstana bufory i kolejka. Zadanie
+  // wchodzilo wtedy w galaz pojedynczych obrazow z pustym uchwytem kolejki,
+  // xQueueReceive walil assertem i panel wpadal w petle restartow z czarnym
+  // ekranem — bez mozliwosci wgrania czegokolwiek po sieci.
+  if (this->rgb_[0] == nullptr || (!this->tryb_strumienia_ && this->kolejka_ == nullptr)) {
+    ESP_LOGW(TAG, "start_stream przed konfiguracja komponentu — pomijam");
+    return;
+  }
   if (this->biegnie_.load())
     return;
   // Poprzednie zadanie moze jeszcze konczyc odczyt (np. tuz po przelaczeniu
