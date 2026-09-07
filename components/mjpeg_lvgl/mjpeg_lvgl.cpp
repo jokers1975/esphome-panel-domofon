@@ -7,7 +7,7 @@
 #include "esp_heap_caps.h"
 #include "esp_cache.h"
 #include "esp_timer.h"
-#include "rom/miniz.h"
+#include "miniz.h"      // z ROM-u ESP32-P4 — bez dokladania biblioteki
 #include "driver/jpeg_decode.h"
 #include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
