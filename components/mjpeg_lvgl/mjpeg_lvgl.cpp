@@ -12,6 +12,7 @@
 #include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <cstring>
 #include <string>
 
@@ -64,10 +65,18 @@ void MjpegLvgl::setup() {
   }
 }
 
+SemaphoreHandle_t MjpegLvgl::blokada_dekodera_ = nullptr;
+
 bool MjpegLvgl::przygotuj_dekoder() {
+  // Konfiguracje komponentow ida po kolei w petli glownej, wiec tworzenie
+  // blokady nie wymaga tu dodatkowej ochrony.
+  if (MjpegLvgl::blokada_dekodera_ == nullptr)
+    MjpegLvgl::blokada_dekodera_ = xSemaphoreCreateMutex();
   jpeg_decode_engine_cfg_t cfg = {};
   cfg.intr_priority = 0;
-  cfg.timeout_ms = 120;     // przy 15 kl/s na ramke jest ok. 66 ms
+  // Czekanie na wolny uklad odbywa sie teraz na naszej blokadzie, wiec ten
+  // limit dotyczy juz tylko samego dekodowania jednej klatki.
+  cfg.timeout_ms = 300;
   esp_err_t err = jpeg_new_decoder_engine(&cfg, &this->dekoder_);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Nie udalo sie uruchomic sprzetowego dekodera JPEG: %s", esp_err_to_name(err));
@@ -464,8 +473,12 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   cfg.output_format = JPEG_DECODE_OUT_FORMAT_RGB565;
   cfg.rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR;   // LVGL pracuje na BGR565
   uint32_t wynik = 0;
+  if (MjpegLvgl::blokada_dekodera_ != nullptr)
+    xSemaphoreTake(MjpegLvgl::blokada_dekodera_, portMAX_DELAY);
   esp_err_t err = jpeg_decoder_process(this->dekoder_, &cfg, this->jpeg_buf_, dlugosc,
                                        this->dekod_buf_, this->dekod_rozmiar_, &wynik);
+  if (MjpegLvgl::blokada_dekodera_ != nullptr)
+    xSemaphoreGive(MjpegLvgl::blokada_dekodera_);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "Dekodowanie nieudane %ux%u (wyrownane %ux%u, MCU %ux%u): %s",
              (unsigned) info.width, (unsigned) info.height,

@@ -94,6 +94,11 @@ class MjpegLvgl : public Component {
   ppa_client_handle_t ppa_{nullptr};   // sprzetowe skalowanie do docelowego rozmiaru
   uint8_t *dekod_buf_{nullptr};        // obraz w rozmiarze zrodlowym, przed skalowaniem
   size_t dekod_rozmiar_{0};
+  // Uklad ma JEDEN sprzetowy dekoder JPEG, a instancji komponentu jest kilka
+  // (okladki i strumien z kamery). Bez wspolnej blokady wchodzily sobie w droge
+  // i sterownik zwracal ESP_ERR_TIMEOUT — okladka radia nie pojawiala sie
+  // dokladnie wtedy, gdy leciał obraz z domofonu.
+  static SemaphoreHandle_t blokada_dekodera_;
   QueueHandle_t kolejka_{nullptr};   // adresy do pobrania w trybie pojedynczym
   bool tryb_strumienia_{false};
   // Opis, ktory oglada LVGL. Wskaznik na niego jest STALY — widget dostaje go
