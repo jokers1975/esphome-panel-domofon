@@ -417,6 +417,49 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
     this->bledow_.fetch_add(1);
     return false;
   }
+  // Sprzetowy dekoder P4 zna tylko cztery uklady probkowania: GRAY, YUV444,
+  // YUV422 i YUV420. Przy innym NIE zwraca bledu — zawisa, az wejdzie limit
+  // czasu, i zostaje z aktywnym DMA w nieokreslonym stanie. To wlasnie robila
+  // okladka Radia ESKA: poprawny baseline 145x145, ale probkowanie Y=2x2,
+  // Cb=1x1, Cr=1x2, czyli chrominancja niesymetryczna. Efektem byly nie tylko
+  // brakujace okladki, ale i paniki w zupelnie innych miejscach (LVGL, alokator
+  // sterty) — czyli objawy rozjechanej pamieci. Czytamy wiec probkowanie
+  // z naglowka SOF i odrzucamy obraz, zanim dotknie go sprzet.
+  {
+    size_t k = 2;
+    while (k + 9 < dlugosc) {
+      if (this->jpeg_buf_[k] != 0xFF) { k++; continue; }
+      const uint8_t zn = this->jpeg_buf_[k + 1];
+      if (zn == 0xC0 || zn == 0xC1 || zn == 0xC2) {
+        const uint8_t skladowych = this->jpeg_buf_[k + 9];
+        bool obslugiwane = false;
+        uint8_t s1 = 0, s2 = 0, s3 = 0;
+        if (skladowych == 1) {
+          obslugiwane = true;                       // szarosc
+        } else if (skladowych == 3 && k + 18 < dlugosc) {
+          s1 = this->jpeg_buf_[k + 11];             // Hi/Vi skladowej Y
+          s2 = this->jpeg_buf_[k + 14];
+          s3 = this->jpeg_buf_[k + 17];
+          obslugiwane = (s2 == 0x11 && s3 == 0x11 &&
+                         (s1 == 0x11 || s1 == 0x21 || s1 == 0x22));
+        }
+        if (!obslugiwane) {
+          ESP_LOGW(TAG,
+                   "JPEG o probkowaniu nieobslugiwanym przez sprzet "
+                   "(skladowych %u: %02X %02X %02X) — pomijam, %ux%u",
+                   skladowych, s1, s2, s3, (unsigned) info.width, (unsigned) info.height);
+          this->blad_formatu_ = true;   // ponawianie nic nie da, plik sie nie zmieni
+          this->bledow_.fetch_add(1);
+          return false;
+        }
+        break;
+      }
+      if (zn == 0xDA || zn == 0xD9) break;
+      if (zn == 0x01 || (zn >= 0xD0 && zn <= 0xD7)) { k += 2; continue; }
+      k += 2 + ((this->jpeg_buf_[k + 2] << 8) | this->jpeg_buf_[k + 3]);
+    }
+  }
+
   // Sterownik zapisuje obraz o wymiarach WYROWNANYCH do bloku MCU, nie o
   // rzeczywistych. Przy szerokosci niebedacej wielokrotnoscia bloku wiersze sa
   // dluzsze, niz wynika z naglowka — LVGL musi dostac te dluzsza wartosc jako
