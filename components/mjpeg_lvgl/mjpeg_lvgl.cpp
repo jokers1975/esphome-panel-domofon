@@ -211,6 +211,25 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   srm.scale_x = static_cast<float>(this->width_) / info.width;
   srm.scale_y = static_cast<float>(this->height_) / info.height;
   srm.mode = PPA_TRANS_MODE_BLOCKING;
+
+  // PPA kwantuje skale do krokow po 1/16, wiec gdy proporcja nie trafia w
+  // wielokrotnosc, zapisuje MNIEJ pikseli niz wynosi rozmiar docelowy — przy
+  // zrodle 500 px brakuje 19 kolumn, przy 600 px trzynastu. Reszta bufora
+  // zostaje z poprzedniego obrazu i widac pionowy pas starej okladki.
+  // Okladki albumow (512, 640) trafiaja idealnie, dlatego problem pokazywal sie
+  // tylko przy logo stacji o dowolnych wymiarach. Liczymy to samo co sterownik
+  // i czyscimy bufor tylko wtedy, gdy obraz go nie wypelni.
+  const uint32_t sx_i = (uint32_t) srm.scale_x;
+  const uint32_t sx_f = (uint32_t) (srm.scale_x * 16) & 15u;
+  const uint32_t sy_i = (uint32_t) srm.scale_y;
+  const uint32_t sy_f = (uint32_t) (srm.scale_y * 16) & 15u;
+  const uint32_t wy_w = sx_i * info.width + sx_f * info.width / 16;
+  const uint32_t wy_h = sy_i * info.height + sy_f * info.height / 16;
+  if (wy_w < this->width_ || wy_h < this->height_) {
+    memset(this->rgb_[this->wypelniany_], 0, this->rgb_rozmiar_);
+    ESP_LOGI(TAG, "Obraz wypelni %ux%u z %ux%u — czyszcze bufor przed skalowaniem",
+             (unsigned) wy_w, (unsigned) wy_h, this->width_, this->height_);
+  }
   esp_err_t blad_ppa = ppa_do_scale_rotate_mirror(this->ppa_, &srm);
   if (blad_ppa != ESP_OK) {
     ESP_LOGW(TAG, "Skalowanie PPA nieudane, skala %.3f, %s", (double) srm.scale_x, esp_err_to_name(blad_ppa));
