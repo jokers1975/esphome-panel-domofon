@@ -66,21 +66,25 @@ void MjpegLvgl::setup() {
 }
 
 SemaphoreHandle_t MjpegLvgl::blokada_dekodera_ = nullptr;
+jpeg_decoder_handle_t MjpegLvgl::dekoder_ = nullptr;
 
 bool MjpegLvgl::przygotuj_dekoder() {
   // Konfiguracje komponentow ida po kolei w petli glownej, wiec tworzenie
   // blokady nie wymaga tu dodatkowej ochrony.
   if (MjpegLvgl::blokada_dekodera_ == nullptr)
     MjpegLvgl::blokada_dekodera_ = xSemaphoreCreateMutex();
-  jpeg_decode_engine_cfg_t cfg = {};
-  cfg.intr_priority = 0;
-  // Czekanie na wolny uklad odbywa sie teraz na naszej blokadzie, wiec ten
-  // limit dotyczy juz tylko samego dekodowania jednej klatki.
-  cfg.timeout_ms = 300;
-  esp_err_t err = jpeg_new_decoder_engine(&cfg, &this->dekoder_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "Nie udalo sie uruchomic sprzetowego dekodera JPEG: %s", esp_err_to_name(err));
-    return false;
+  if (MjpegLvgl::dekoder_ == nullptr) {
+    jpeg_decode_engine_cfg_t cfg = {};
+    cfg.intr_priority = 0;
+    // Czekanie na wolny uklad odbywa sie na naszej blokadzie, wiec ten limit
+    // dotyczy juz tylko samego dekodowania jednej klatki.
+    cfg.timeout_ms = 300;
+    esp_err_t err = jpeg_new_decoder_engine(&cfg, &MjpegLvgl::dekoder_);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Nie udalo sie uruchomic sprzetowego dekodera JPEG: %s", esp_err_to_name(err));
+      return false;
+    }
+    ESP_LOGCONFIG(TAG, "Sprzetowy dekoder JPEG uruchomiony (wspolny dla instancji)");
   }
 
   // Bufory wyjsciowe musi przydzielic sterownik — wymaga wyrownania pod DMA.
@@ -475,7 +479,7 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   uint32_t wynik = 0;
   if (MjpegLvgl::blokada_dekodera_ != nullptr)
     xSemaphoreTake(MjpegLvgl::blokada_dekodera_, portMAX_DELAY);
-  esp_err_t err = jpeg_decoder_process(this->dekoder_, &cfg, this->jpeg_buf_, dlugosc,
+  esp_err_t err = jpeg_decoder_process(MjpegLvgl::dekoder_, &cfg, this->jpeg_buf_, dlugosc,
                                        this->dekod_buf_, this->dekod_rozmiar_, &wynik);
   if (MjpegLvgl::blokada_dekodera_ != nullptr)
     xSemaphoreGive(MjpegLvgl::blokada_dekodera_);

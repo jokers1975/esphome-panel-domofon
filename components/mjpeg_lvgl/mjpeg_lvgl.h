@@ -90,7 +90,13 @@ class MjpegLvgl : public Component {
   size_t rgb_rozmiar_{0};
   std::atomic<int> gotowy_{-1};      // indeks bufora z kompletna klatka
   int wypelniany_{0};
-  jpeg_decoder_handle_t dekoder_{nullptr};
+  // JEDEN silnik dekodera na caly uklad, wspolny dla wszystkich instancji.
+  // Wczesniej kazda instancja tworzyla wlasny przez jpeg_new_decoder_engine —
+  // a ESP32-P4 ma tylko jeden blok sprzetowy. Dwa silniki mialy osobne
+  // przerwania i semafory nad tym samym sprzetem, wiec ich stany sie mieszaly:
+  // okladka konczyla sie ESP_ERR_TIMEOUT dokladnie wtedy, gdy leciał strumien
+  // z kamery, a w tle sypala sie pamiec (panika w LVGL i w alokatorze sterty).
+  static jpeg_decoder_handle_t dekoder_;
   ppa_client_handle_t ppa_{nullptr};   // sprzetowe skalowanie do docelowego rozmiaru
   uint8_t *dekod_buf_{nullptr};        // obraz w rozmiarze zrodlowym, przed skalowaniem
   size_t dekod_rozmiar_{0};
