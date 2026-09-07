@@ -77,10 +77,10 @@ bool MjpegLvgl::przygotuj_dekoder() {
   // Bufory wyjsciowe musi przydzielic sterownik — wymaga wyrownania pod DMA.
   jpeg_decode_memory_alloc_cfg_t mem = {};
   mem.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
-  // Szerokosc wiersza bywa zaokraglana w gore do 4 pikseli (patrz dekoduj),
-  // wiec bufor ma zapas na te trzy dodatkowe kolumny.
+  // Wiersz jest wyrownywany w gore do 32 pikseli (patrz dekoduj), wiec bufor
+  // musi miec zapas na te dodatkowe kolumny.
   const size_t potrzeba =
-      static_cast<size_t>((this->width_ + 3u) & ~3u) * this->height_ * 2;
+      static_cast<size_t>((this->width_ + 31u) & ~31u) * this->height_ * 2;
   for (int i = 0; i < 2; i++) {
     size_t przydzielono = 0;
     this->rgb_[i] = static_cast<uint8_t *>(jpeg_alloc_decoder_mem(potrzeba, &mem, &przydzielono));
@@ -301,10 +301,10 @@ bool MjpegLvgl::dekoduj_png(uint32_t dlugosc) {
   // Zejscie z rozmiarem, gdy obraz nie miesci sie w buforze posrednim.
   // Bierzemy co n-ty piksel — reszte skalowania i tak zrobi PPA.
   uint32_t krok = 1;
-  while (((size_t)((szer / krok + 15) & ~15u)) * (wys / krok) * 2 > this->dekod_rozmiar_)
+  while (((size_t)((szer / krok + 31) & ~31u)) * (wys / krok) * 2 > this->dekod_rozmiar_)
     krok++;
   const uint32_t szer_c = szer / krok, wys_c = wys / krok;
-  const uint32_t wiersz_px = (szer_c + 15u) & ~15u;   // PPA lubi rowne wiersze
+  const uint32_t wiersz_px = (szer_c + 31u) & ~31u;   // 64 B = linia cache'u
   if (krok > 1)
     ESP_LOGI(TAG, "PNG %ux%u nie miesci sie w buforze — biore co %u piksel (%ux%u)",
              (unsigned) szer, (unsigned) wys, (unsigned) krok,
@@ -530,9 +530,14 @@ bool MjpegLvgl::skaluj_i_odslon(uint32_t szer, uint32_t wys, uint32_t wiersz_px,
     this->bledow_.fetch_add(1);
     return false;
   }
-  // Szerokosc wiersza zaokraglona w gore do 4 pikseli — PPA pisze przez DMA
-  // i lubi rowne wiersze. LVGL i tak czyta wy_w pikseli, reszta to zapas.
-  const uint32_t stride_px = (wy_w + 3u) & ~3u;
+  // Szerokosc wiersza wyrownana do 32 PIKSELI, czyli 64 bajtow — tyle ma linia
+  // cache'u na tym ukladzie. PPA pisze wynik przez DMA i unieważnia cache
+  // wierszami; przy wierszu niebedacym wielokrotnoscia linii panel wywracal
+  // sie natychmiast. Widac to bylo jako regularnosc: dzialaly dokladnie te
+  // rozmiary, ktorych wiersz trafial w 64 B (480 px = 960 B, 800 px = 1600 B),
+  // a wywracaly sie te, ktore nie trafialy (788 px = 1576 B przy okladce PNG,
+  // 840 px = 1680 B przy kamerze drzwi). Zaokraglenie do 4 pikseli bylo za male.
+  const uint32_t stride_px = (wy_w + 31u) & ~31u;
   srm.out.pic_w = stride_px;
   srm.out.pic_h = wy_h;
   srm.out.block_offset_x = 0;
