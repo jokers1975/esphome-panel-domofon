@@ -43,8 +43,6 @@ void MjpegLvgl::setup() {
     return;
   }
 
-  // Opis obrazu dla LVGL wypelniamy raz — potem zmienia sie tylko wskaznik
-  // na dane, gdy odslaniamy swiezo zdekodowana klatke.
   this->opis_.header.magic = LV_IMAGE_HEADER_MAGIC;
   this->opis_.header.cf = LV_COLOR_FORMAT_RGB565;
   this->opis_.header.w = this->width_;
@@ -261,10 +259,13 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
     return false;
   }
 
-  this->opis_.header.w = wy_w;
-  this->opis_.header.h = wy_h;
-  this->opis_.header.stride = stride_px * 2;
-  this->opis_.data_size = stride_px * wy_h * 2;
+  // Wymiary zapisujemy obok bufora, nie w opisie dla LVGL. Opis wypelni
+  // petla glowna, gdy odbierze te klatke — wtedy nikt z niego nie rysuje.
+  MjpegLvgl::Ksztalt &k = this->ksztalt_[this->wypelniany_];
+  k.szer = wy_w;
+  k.wys = wy_h;
+  k.wiersz_b = stride_px * 2;
+  k.rozmiar = stride_px * wy_h * 2;
   if (this->zdekodowanych_.load() == 0 || szer_wyr != this->ost_szer_) {
     ESP_LOGI(TAG, "Obraz %ux%u -> %ux%u (blok %ux%u)", (unsigned) info.width,
              (unsigned) info.height, (unsigned) wy_w, (unsigned) wy_h, mcu_w, mcu_h);
@@ -341,7 +342,14 @@ bool MjpegLvgl::nowa_klatka() {
   const int i = this->gotowy_.exchange(-1);
   if (i < 0)
     return false;
+  // Jestesmy w petli glownej i LVGL w tej chwili nie rysuje — dopiero teraz
+  // przepisujemy wymiary do opisu, ktory oglada widget.
+  const MjpegLvgl::Ksztalt &k = this->ksztalt_[i];
   this->opis_.data = this->rgb_[i];
+  this->opis_.header.w = k.szer;
+  this->opis_.header.h = k.wys;
+  this->opis_.header.stride = k.wiersz_b;
+  this->opis_.data_size = k.rozmiar;
   return true;
 }
 
@@ -376,6 +384,7 @@ void MjpegLvgl::start_stream() {
   }
   this->biegnie_.store(true);
   this->ramek_.store(0);
+  this->poprzednio_ = 0;   // bez tego (n - poprzednio_) przekreca sie na uint32
   this->bledow_.store(0);
   // Wlasne zadanie: pobieranie nie moze blokowac glownej petli, bo to
   // wlasnie ono zawieszalo panel przy okladkach.

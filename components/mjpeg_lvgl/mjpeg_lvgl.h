@@ -93,7 +93,20 @@ class MjpegLvgl : public Component {
   size_t dekod_rozmiar_{0};
   QueueHandle_t kolejka_{nullptr};   // adresy do pobrania w trybie pojedynczym
   bool tryb_strumienia_{false};
+  // Opis, ktory oglada LVGL. Wskaznik na niego jest STALY — widget dostaje go
+  // raz przez lv_image_set_src. Wypelnia go wylacznie petla glowna
+  // (w nowa_klatka), nigdy zadanie dekodujace.
   lv_image_dsc_t opis_{};
+
+  // Wymiary gotowej klatki, po jednym komplecie na bufor. Zadanie dekodujace
+  // zapisuje je TU, a nie w opis_, bo tamten czyta w tym samym czasie petla
+  // glowna. Wspolny opis byl bezpieczny dopoki obraz mial staly rozmiar; odkad
+  // rozmiar zmienia sie przy przelaczeniu kamery, LVGL trafial na nowa
+  // wysokosc przy starym wskazniku i czytal poza buforem: exception/panic.
+  struct Ksztalt {
+    uint32_t szer{0}, wys{0}, wiersz_b{0}, rozmiar{0};
+  };
+  Ksztalt ksztalt_[2];
   std::atomic<uint32_t> zdekodowanych_{0};
   std::atomic<uint32_t> us_dekod_{0};   // suma czasu dekodowania w oknie pomiaru
   uint32_t ost_dekod_ms_{0};           // kiedy ostatnio dekodowalismy klatke
