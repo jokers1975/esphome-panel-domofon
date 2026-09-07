@@ -78,7 +78,10 @@ bool MjpegLvgl::przygotuj_dekoder() {
   // Bufory wyjsciowe musi przydzielic sterownik — wymaga wyrownania pod DMA.
   jpeg_decode_memory_alloc_cfg_t mem = {};
   mem.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
-  const size_t potrzeba = static_cast<size_t>(this->width_) * this->height_ * 2;
+  // Szerokosc wiersza bywa zaokraglana w gore do 4 pikseli (patrz dekoduj),
+  // wiec bufor ma zapas na te trzy dodatkowe kolumny.
+  const size_t potrzeba =
+      static_cast<size_t>((this->width_ + 3u) & ~3u) * this->height_ * 2;
   for (int i = 0; i < 2; i++) {
     size_t przydzielono = 0;
     this->rgb_[i] = static_cast<uint8_t *>(jpeg_alloc_decoder_mem(potrzeba, &mem, &przydzielono));
@@ -215,60 +218,56 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   // Jedna skala dla obu osi. Osobne scale_x i scale_y rozciagaly obraz do
   // ksztaltu bufora — kamera 4:3 wcisnieta w kafel 3:4 wygladala jak odbicie
   // w krzywym lustrze. Bierzemy mniejsza z dwoch skal, wiec caly obraz sie
-  // miesci, a to, co zostaje, jest czarnym marginesem.
+  // miesci i zachowuje proporcje.
   const float skala = std::min(static_cast<float>(this->width_) / info.width,
                                static_cast<float>(this->height_) / info.height);
   srm.scale_x = skala;
   srm.scale_y = skala;
   srm.mode = PPA_TRANS_MODE_BLOCKING;
 
-  // PPA kwantuje skale do krokow po 1/16, wiec gdy proporcja nie trafia w
-  // wielokrotnosc, zapisuje MNIEJ pikseli niz wynosi rozmiar docelowy — przy
-  // zrodle 500 px brakuje 19 kolumn, przy 600 px trzynastu. Reszta bufora
-  // zostaje z poprzedniego obrazu i widac pionowy pas starej okladki.
-  // Okladki albumow (512, 640) trafiaja idealnie, dlatego problem pokazywal sie
-  // tylko przy logo stacji o dowolnych wymiarach. Liczymy to samo co sterownik
-  // i czyscimy bufor tylko wtedy, gdy obraz go nie wypelni.
+  // PPA kwantuje skale do krokow po 1/16, wiec faktyczny rozmiar wyniku
+  // rzadko rowna sie dokladnie rozmiarowi bufora. Zamiast dopychac obraz do
+  // ksztaltu bufora i czyscic reszte, robimy obraz DOKLADNIE takiej wielkosci,
+  // jaka wyszla ze skalowania — LVGL dostaje wtedy wlasciwe proporcje i sam
+  // wysrodkowuje go w kaflu. Nie ma marginesu, wiec nie ma tez czego czyscic.
+  //
+  // Poprzednia wersja robila memset calego bufora (614 kB) plus zapis cache'u
+  // przy KAZDEJ klatce wideo — dwanascie razy na sekunde. To wystarczylo,
+  // zeby panel zaliczyl niebieski ekran i restart od watchdoga.
   const uint32_t sx_i = (uint32_t) srm.scale_x;
   const uint32_t sx_f = (uint32_t) (srm.scale_x * 16) & 15u;
   const uint32_t sy_i = (uint32_t) srm.scale_y;
   const uint32_t sy_f = (uint32_t) (srm.scale_y * 16) & 15u;
   const uint32_t wy_w = sx_i * info.width + sx_f * info.width / 16;
   const uint32_t wy_h = sy_i * info.height + sy_f * info.height / 16;
-  // Wysrodkowanie: PPA zapisuje od podanego przesuniecia, wiec margines
-  // rozklada sie po rowno na obie strony zamiast zbierac sie w prawym
-  // dolnym rogu.
-  srm.out.block_offset_x = wy_w < this->width_ ? (this->width_ - wy_w) / 2 : 0;
-  srm.out.block_offset_y = wy_h < this->height_ ? (this->height_ - wy_h) / 2 : 0;
-  if (wy_w < this->width_ || wy_h < this->height_) {
-    memset(this->rgb_[this->wypelniany_], 0, this->rgb_rozmiar_);
-    // Samo memset NIE wystarcza. Bufor lezy w pamieci obslugiwanej przez cache,
-    // wiec zera trafiaja najpierw tam. PPA zapisuje przez DMA prosto do pamieci
-    // i na koniec UNIEWAZNIA ten obszar cache'u, zeby procesor zobaczyl swieze
-    // dane — a unieważnienie odrzuca brudne linie, czyli moje zera. W marginesie
-    // zostawala wtedy poprzednia okladka, mimo ze log mowil o czyszczeniu.
-    // Wymuszamy zapis cache'u do pamieci PRZED operacja DMA.
-    esp_err_t bc = esp_cache_msync(this->rgb_[this->wypelniany_], this->rgb_rozmiar_,
-                                   ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-    ESP_LOGI(TAG, "Obraz wypelni %ux%u z %ux%u — czyszcze bufor (zapis cache: %s)",
-             (unsigned) wy_w, (unsigned) wy_h, this->width_, this->height_, esp_err_to_name(bc));
+  if (wy_w == 0 || wy_h == 0) {
+    ESP_LOGW(TAG, "Skalowanie dalo pusty obraz (%ux%u)", (unsigned) wy_w, (unsigned) wy_h);
+    this->bledow_.fetch_add(1);
+    return false;
   }
+  // Szerokosc wiersza zaokraglona w gore do 4 pikseli — PPA pisze przez DMA
+  // i lubi rowne wiersze. LVGL i tak czyta wy_w pikseli, reszta to zapas.
+  const uint32_t stride_px = (wy_w + 3u) & ~3u;
+  srm.out.pic_w = stride_px;
+  srm.out.pic_h = wy_h;
+  srm.out.block_offset_x = 0;
+  srm.out.block_offset_y = 0;
   esp_err_t blad_ppa = ppa_do_scale_rotate_mirror(this->ppa_, &srm);
   if (blad_ppa != ESP_OK) {
     ESP_LOGW(TAG, "Skalowanie PPA nieudane, skala %.3f, %s", (double) srm.scale_x, esp_err_to_name(blad_ppa));
     ESP_LOGW(TAG, "  (%ux%u -> %ux%u)", (unsigned) info.width,
-             (unsigned) info.height, this->width_, this->height_);
+             (unsigned) info.height, (unsigned) wy_w, (unsigned) wy_h);
     this->bledow_.fetch_add(1);
     return false;
   }
 
-  this->opis_.header.w = this->width_;
-  this->opis_.header.h = this->height_;
-  this->opis_.header.stride = this->width_ * 2;
-  this->opis_.data_size = static_cast<uint32_t>(this->width_) * this->height_ * 2;
+  this->opis_.header.w = wy_w;
+  this->opis_.header.h = wy_h;
+  this->opis_.header.stride = stride_px * 2;
+  this->opis_.data_size = stride_px * wy_h * 2;
   if (this->zdekodowanych_.load() == 0 || szer_wyr != this->ost_szer_) {
     ESP_LOGI(TAG, "Obraz %ux%u -> %ux%u (blok %ux%u)", (unsigned) info.width,
-             (unsigned) info.height, this->width_, this->height_, mcu_w, mcu_h);
+             (unsigned) info.height, (unsigned) wy_w, (unsigned) wy_h, mcu_w, mcu_h);
     this->ost_szer_ = szer_wyr;
   }
   // Odslon wypelniony bufor i przelacz sie na drugi.
