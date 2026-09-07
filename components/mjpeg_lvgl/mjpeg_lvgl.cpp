@@ -1,10 +1,12 @@
 #include "mjpeg_lvgl.h"
+#include <algorithm>
 #ifdef USE_ESP32
 
 #include "esphome/core/log.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
 #include "esp_cache.h"
+#include "esp_timer.h"
 #include "driver/jpeg_decode.h"
 #include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
@@ -210,8 +212,14 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   srm.out.pic_h = this->height_;
   srm.out.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
   srm.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
-  srm.scale_x = static_cast<float>(this->width_) / info.width;
-  srm.scale_y = static_cast<float>(this->height_) / info.height;
+  // Jedna skala dla obu osi. Osobne scale_x i scale_y rozciagaly obraz do
+  // ksztaltu bufora — kamera 4:3 wcisnieta w kafel 3:4 wygladala jak odbicie
+  // w krzywym lustrze. Bierzemy mniejsza z dwoch skal, wiec caly obraz sie
+  // miesci, a to, co zostaje, jest czarnym marginesem.
+  const float skala = std::min(static_cast<float>(this->width_) / info.width,
+                               static_cast<float>(this->height_) / info.height);
+  srm.scale_x = skala;
+  srm.scale_y = skala;
   srm.mode = PPA_TRANS_MODE_BLOCKING;
 
   // PPA kwantuje skale do krokow po 1/16, wiec gdy proporcja nie trafia w
@@ -227,6 +235,11 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   const uint32_t sy_f = (uint32_t) (srm.scale_y * 16) & 15u;
   const uint32_t wy_w = sx_i * info.width + sx_f * info.width / 16;
   const uint32_t wy_h = sy_i * info.height + sy_f * info.height / 16;
+  // Wysrodkowanie: PPA zapisuje od podanego przesuniecia, wiec margines
+  // rozklada sie po rowno na obie strony zamiast zbierac sie w prawym
+  // dolnym rogu.
+  srm.out.block_offset_x = wy_w < this->width_ ? (this->width_ - wy_w) / 2 : 0;
+  srm.out.block_offset_y = wy_h < this->height_ ? (this->height_ - wy_h) / 2 : 0;
   if (wy_w < this->width_ || wy_h < this->height_) {
     memset(this->rgb_[this->wypelniany_], 0, this->rgb_rozmiar_);
     // Samo memset NIE wystarcza. Bufor lezy w pamieci obslugiwanej przez cache,
@@ -478,7 +491,9 @@ bool MjpegLvgl::czytaj_strumien() {
           w_ramce = false;
           this->ostatnia_dl_.store(dl);
           this->ramek_.fetch_add(1);
+          const int64_t t0 = esp_timer_get_time();
           this->dekoduj(dl);
+          this->us_dekod_.fetch_add((uint32_t) (esp_timer_get_time() - t0));
         }
       }
       poprzedni = b;
@@ -504,8 +519,11 @@ void MjpegLvgl::loop() {
   if (this->biegnie_.load() && teraz - this->ostatni_raport_ > 5000) {
     this->ostatni_raport_ = teraz;
     const uint32_t n = this->ramek_.load();
-    ESP_LOGI(TAG, "ramek: %u (%.1f/s), ostatnia %u B, odrzuconych: %u", n,
-             (n - this->poprzednio_) / 5.0f, this->ostatnia_dl_.load(), this->bledow_.load());
+    this->fps_ost_ = (n - this->poprzednio_) / 5.0f;
+    this->obc_ost_ = this->us_dekod_.exchange(0) / 50000.0f;   // % z 5 s
+    ESP_LOGI(TAG, "ramek: %u (%.1f/s), ostatnia %u B, odrzuconych: %u, obciazenie %.0f%%", n,
+             this->fps_ost_, this->ostatnia_dl_.load(), this->bledow_.load(),
+             (double) this->obc_ost_);
     ESP_LOGI(TAG, "zdekodowanych: %u", this->zdekodowanych_.load());
     // Zapas stosu zadania dekodujacego. Stos ma 12288 B; przy 6144 B i tablicy
     // lokalnej 2048 B lancuch HTTP + dekoder + PPA podchodzil pod wartownika,

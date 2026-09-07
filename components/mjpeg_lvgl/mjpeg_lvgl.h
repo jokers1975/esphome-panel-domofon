@@ -46,6 +46,13 @@ class MjpegLvgl : public Component {
   // Adres ostatniego POMYSLNIE pobranego i zdekodowanego obrazu. Konfiguracja
   // porownuje z nim, zeby nieudane pobranie bylo ponawiane przy kolejnej okazji.
   std::string ostatni_udany() const { return this->ostatni_ok_; }
+  // Pomiary z ostatniego okna 5 s — wystawiane do Home Assistanta, zeby dalo
+  // sie zdalnie stwierdzic, czy panel nadaza za strumieniem. Gdy obciazenie
+  // dobija do 100%, dekodowanie trwa dluzej niz odstep miedzy klatkami i
+  // opoznienie obrazu rosnie samo z siebie.
+  float klatek_na_s() const { return this->fps_ost_; }
+  float obciazenie() const { return this->obc_ost_; }
+
   // Opis obrazu dla LVGL. Wskazuje na bufor, ktory wlasnie zostal odslonięty.
   const lv_image_dsc_t *opis_obrazu() const { return &this->opis_; }
 
@@ -81,6 +88,9 @@ class MjpegLvgl : public Component {
   bool tryb_strumienia_{false};
   lv_image_dsc_t opis_{};
   std::atomic<uint32_t> zdekodowanych_{0};
+  std::atomic<uint32_t> us_dekod_{0};   // suma czasu dekodowania w oknie pomiaru
+  float fps_ost_{0.0f};
+  float obc_ost_{0.0f};
   uint32_t ost_szer_{0};   // ostatnia wyrownana szerokosc — do logu przy zmianie
   // Czytany takze z glownej petli (loop) w chwili, gdy zadanie sam sobie
   // zeruje uchwyt na wyjsciu — stad atomowy dostep zamiast zwyklego wskaznika.
