@@ -38,6 +38,9 @@ class MjpegLvgl : public Component {
 
   // Wolane z glownej petli: czy czeka nowa zdekodowana klatka.
   bool nowa_klatka();
+  // Adres ostatniego POMYSLNIE pobranego i zdekodowanego obrazu. Konfiguracja
+  // porownuje z nim, zeby nieudane pobranie bylo ponawiane przy kolejnej okazji.
+  std::string ostatni_udany() const { return this->ostatni_ok_; }
   // Opis obrazu dla LVGL. Wskazuje na bufor, ktory wlasnie zostal odslonięty.
   const lv_image_dsc_t *opis_obrazu() const { return &this->opis_; }
 
@@ -59,6 +62,7 @@ class MjpegLvgl : public Component {
   uint8_t *jpeg_buf_{nullptr};       // surowa ramka JPEG (PSRAM)
   // Bufor odczytu z gniazda. Byl tablica lokalna w zadaniu — 2 kB z 6 kB stosu.
   uint8_t *kawalek_{nullptr};
+  std::string ostatni_ok_;
   uint8_t *rgb_[2]{nullptr, nullptr};  // dwa bufory RGB565: rysowany i wypelniany
   size_t rgb_rozmiar_{0};
   std::atomic<int> gotowy_{-1};      // indeks bufora z kompletna klatka

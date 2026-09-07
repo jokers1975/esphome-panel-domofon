@@ -315,8 +315,11 @@ void MjpegLvgl::task_loop() {
           }
           ok = this->pobierz_jeden(*url);
         }
-        if (!ok)
+        if (ok) {
+          this->ostatni_ok_ = *url;
+        } else {
           ESP_LOGW(TAG, "Nie udalo sie pobrac okladki po 4 probach: %s", url->c_str());
+        }
         delete url;
       }
     }
