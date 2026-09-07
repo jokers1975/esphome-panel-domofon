@@ -89,6 +89,7 @@ class MjpegLvgl : public Component {
   lv_image_dsc_t opis_{};
   std::atomic<uint32_t> zdekodowanych_{0};
   std::atomic<uint32_t> us_dekod_{0};   // suma czasu dekodowania w oknie pomiaru
+  uint32_t ost_dekod_ms_{0};           // kiedy ostatnio dekodowalismy klatke
   float fps_ost_{0.0f};
   float obc_ost_{0.0f};
   uint32_t ost_szer_{0};   // ostatnia wyrownana szerokosc — do logu przy zmianie

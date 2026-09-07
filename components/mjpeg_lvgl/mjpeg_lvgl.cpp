@@ -490,9 +490,18 @@ bool MjpegLvgl::czytaj_strumien() {
           w_ramce = false;
           this->ostatnia_dl_.store(dl);
           this->ramek_.fetch_add(1);
-          const int64_t t0 = esp_timer_get_time();
-          this->dekoduj(dl);
-          this->us_dekod_.fetch_add((uint32_t) (esp_timer_get_time() - t0));
+          // Ograniczenie tempa dekodowania. Kamera potrafi przyslac 17 klatek
+          // na sekunde, a panel przy pelnoekranowym obrazie rysuje ich 3-5 —
+          // reszta byla dekodowana po to, zeby ja natychmiast nadpisac.
+          // Klatki ponad limit odrzucamy zaraz po zlozeniu, bez dekodowania.
+          const uint32_t teraz_ms = millis();
+          const uint32_t odstep = this->fps_ > 0 ? 1000u / this->fps_ : 0u;
+          if (odstep == 0 || teraz_ms - this->ost_dekod_ms_ >= odstep) {
+            this->ost_dekod_ms_ = teraz_ms;
+            const int64_t t0 = esp_timer_get_time();
+            this->dekoduj(dl);
+            this->us_dekod_.fetch_add((uint32_t) (esp_timer_get_time() - t0));
+          }
         }
       }
       poprzedni = b;
