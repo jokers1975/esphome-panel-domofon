@@ -111,7 +111,13 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   // Okladki plyt przychodza w roznych rozmiarach, wiec wymiary czytamy
   // z naglowka kazdej ramki zamiast ufac konfiguracji.
   jpeg_decode_picture_info_t info = {};
-  if (jpeg_decoder_get_info(this->jpeg_buf_, dlugosc, &info) != ESP_OK) {
+  esp_err_t blad = jpeg_decoder_get_info(this->jpeg_buf_, dlugosc, &info);
+  if (blad != ESP_OK) {
+    // Bylo ciche. Okladki radia (145x145) nie pojawialy sie, a w logu nie bylo
+    // po nich sladu — nie dalo sie odroznic nieudanego odczytu naglowka od
+    // nieudanego dekodowania czy od tego, ze pobranie w ogole nie ruszylo.
+    ESP_LOGW(TAG, "Odczyt naglowka JPEG nieudany (%u B): %s",
+             (unsigned) dlugosc, esp_err_to_name(blad));
     this->bledow_.fetch_add(1);
     return false;
   }
@@ -142,6 +148,10 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   esp_err_t err = jpeg_decoder_process(this->dekoder_, &cfg, this->jpeg_buf_, dlugosc,
                                        this->dekod_buf_, this->dekod_rozmiar_, &wynik);
   if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Dekodowanie nieudane %ux%u (wyrownane %ux%u, MCU %ux%u): %s",
+             (unsigned) info.width, (unsigned) info.height,
+             (unsigned) szer_wyr, (unsigned) wys_wyr,
+             (unsigned) mcu_w, (unsigned) mcu_h, esp_err_to_name(err));
     this->bledow_.fetch_add(1);
     return false;
   }
@@ -165,8 +175,10 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   srm.scale_x = static_cast<float>(this->width_) / info.width;
   srm.scale_y = static_cast<float>(this->height_) / info.height;
   srm.mode = PPA_TRANS_MODE_BLOCKING;
-  if (ppa_do_scale_rotate_mirror(this->ppa_, &srm) != ESP_OK) {
-    ESP_LOGW(TAG, "Skalowanie PPA nieudane (%ux%u -> %ux%u)", (unsigned) info.width,
+  esp_err_t blad_ppa = ppa_do_scale_rotate_mirror(this->ppa_, &srm);
+  if (blad_ppa != ESP_OK) {
+    ESP_LOGW(TAG, "Skalowanie PPA nieudane, skala %.3f, %s", (double) srm.scale_x, esp_err_to_name(blad_ppa));
+    ESP_LOGW(TAG, "  (%ux%u -> %ux%u)", (unsigned) info.width,
              (unsigned) info.height, this->width_, this->height_);
     this->bledow_.fetch_add(1);
     return false;
