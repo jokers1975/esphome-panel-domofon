@@ -7,6 +7,7 @@
 #include "esp_heap_caps.h"
 #include "esp_cache.h"
 #include "esp_timer.h"
+#include "rom/miniz.h"
 #include "driver/jpeg_decode.h"
 #include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
@@ -111,6 +112,243 @@ bool MjpegLvgl::przygotuj_dekoder() {
   return true;
 }
 
+
+// ---------------------------------------------------------------------------
+// Programowy dekoder PNG.
+//
+// Sprzetowy dekoder ESP32-P4 obsluguje wylacznie JPEG, a czesc stacji radiowych
+// podaje okladki jako PNG. Rozpakowanie robi miniz z ROM-u ukladu (tinfl), wiec
+// firmware nie rosnie o zadna biblioteke. Obslugujemy 8 bitow na kanal bez
+// przeplotu — tak zapisana jest praktycznie kazda okladka.
+// ---------------------------------------------------------------------------
+static inline uint32_t png_be32(const uint8_t *p) {
+  return ((uint32_t) p[0] << 24) | ((uint32_t) p[1] << 16) | ((uint32_t) p[2] << 8) | p[3];
+}
+
+// Rekonstrukcja bajtu wedlug filtra PNG (rozdzial 9 specyfikacji).
+static inline uint8_t png_paeth(int a, int b, int c) {
+  const int p = a + b - c;
+  const int pa = abs(p - a), pb = abs(p - b), pc = abs(p - c);
+  if (pa <= pb && pa <= pc)
+    return (uint8_t) a;
+  return pb <= pc ? (uint8_t) b : (uint8_t) c;
+}
+
+bool MjpegLvgl::dekoduj_png(uint32_t dlugosc) {
+  const uint8_t *d = this->jpeg_buf_;
+  if (dlugosc < 45 || png_be32(d + 12) != 0x49484452u /* IHDR */) {
+    ESP_LOGW(TAG, "PNG bez naglowka IHDR (%u B)", (unsigned) dlugosc);
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+  const uint32_t szer = png_be32(d + 16);
+  const uint32_t wys = png_be32(d + 20);
+  const uint8_t glebia = d[24], typ = d[25], przeplot = d[28];
+  // Glebia 1/2/4 wystepuje w prostych logo stacji, 16 w skanach. Obslugujemy
+  // wszystkie; przeplot Adam7 juz nie — to inny uklad danych i rzadkosc.
+  if ((glebia != 1 && glebia != 2 && glebia != 4 && glebia != 8 && glebia != 16) ||
+      przeplot != 0) {
+    ESP_LOGW(TAG, "PNG %ux%u: glebia %u bit, przeplot %u — nieobslugiwane",
+             (unsigned) szer, (unsigned) wys, glebia, przeplot);
+    this->blad_formatu_ = true;
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+  if (glebia < 8 && typ != 0 && typ != 3) {
+    ESP_LOGW(TAG, "PNG: glebia %u bit dozwolona tylko dla szarosci i palety", glebia);
+    this->blad_formatu_ = true;
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+  int kanaly;
+  switch (typ) {
+    case 0: kanaly = 1; break;   // szarosc
+    case 2: kanaly = 3; break;   // RGB
+    case 3: kanaly = 1; break;   // paleta
+    case 4: kanaly = 2; break;   // szarosc + alfa
+    case 6: kanaly = 4; break;   // RGBA
+    default:
+      ESP_LOGW(TAG, "PNG: nieznany typ koloru %u", typ);
+      this->blad_formatu_ = true;
+      this->bledow_.fetch_add(1);
+      return false;
+  }
+  if (szer == 0 || wys == 0 || szer > 4096 || wys > 4096) {
+    ESP_LOGW(TAG, "PNG o niedorzecznym rozmiarze %ux%u", (unsigned) szer, (unsigned) wys);
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+
+  // Przejscie po blokach: sklejamy IDAT i zapamietujemy palete.
+  uint8_t paleta[256 * 3] = {};
+  uint32_t poz = 8, dl_idat = 0;
+  const uint8_t *idat_pocz = nullptr;
+  bool ciagle = true;      // czy bloki IDAT leza obok siebie
+  while (poz + 12 <= dlugosc) {
+    const uint32_t dl = png_be32(d + poz);
+    const uint32_t typ_bloku = png_be32(d + poz + 4);
+    const uint8_t *dane = d + poz + 8;
+    if (poz + 12 + (size_t) dl > dlugosc)
+      break;
+    if (typ_bloku == 0x504C5445u && dl <= sizeof(paleta)) {        // PLTE
+      memcpy(paleta, dane, dl);
+    } else if (typ_bloku == 0x49444154u) {                          // IDAT
+      if (idat_pocz == nullptr)
+        idat_pocz = dane;
+      else if (idat_pocz + dl_idat != dane)
+        ciagle = false;
+      dl_idat += dl;
+    } else if (typ_bloku == 0x49454E44u) {                          // IEND
+      break;
+    }
+    poz += 12 + dl;
+  }
+  if (idat_pocz == nullptr || dl_idat == 0) {
+    ESP_LOGW(TAG, "PNG bez danych obrazu");
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+
+  // Bloki IDAT bywaja rozbite; tinfl chce jednego ciaglego wejscia. Sklejamy
+  // je w miejscu, przesuwajac dane do przodu — bufor jest nasz, a oryginal
+  // nie jest juz potrzebny.
+  if (!ciagle) {
+    uint8_t *cel = this->jpeg_buf_ + dlugosc;   // sklejamy ZA obrazem
+    if (dlugosc + dl_idat > this->buffer_size_) {
+      ESP_LOGW(TAG, "PNG: brak miejsca na sklejenie blokow IDAT");
+      this->bledow_.fetch_add(1);
+      return false;
+    }
+    uint32_t p2 = 8, zapisane = 0;
+    while (p2 + 12 <= dlugosc) {
+      const uint32_t dl = png_be32(d + p2);
+      if (png_be32(d + p2 + 4) == 0x49444154u) {
+        memcpy(cel + zapisane, d + p2 + 8, dl);
+        zapisane += dl;
+      }
+      p2 += 12 + dl;
+    }
+    idat_pocz = cel;
+  }
+
+  // Rozpakowanie. Wynik to dla kazdego wiersza bajt filtra + piksele.
+  // Przy glebi ponizej 8 bitow piksele sa upakowane, a filtr i tak dziala na
+  // calych bajtach — stad osobno dlugosc wiersza i krok filtra.
+  const size_t wiersz_b = ((size_t) szer * kanaly * glebia + 7) / 8;
+  const int krok_filtra = (kanaly * glebia) / 8 > 0 ? (kanaly * glebia) / 8 : 1;
+  const size_t surowy_b = (wiersz_b + 1) * wys;
+  uint8_t *surowy = static_cast<uint8_t *>(
+      heap_caps_malloc(surowy_b, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (surowy == nullptr)
+    surowy = static_cast<uint8_t *>(heap_caps_malloc(surowy_b, MALLOC_CAP_8BIT));
+  if (surowy == nullptr) {
+    ESP_LOGW(TAG, "PNG %ux%u: brak %u B na dane po rozpakowaniu",
+             (unsigned) szer, (unsigned) wys, (unsigned) surowy_b);
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+  const size_t wyszlo = tinfl_decompress_mem_to_mem(
+      surowy, surowy_b, idat_pocz, dl_idat, TINFL_FLAG_PARSE_ZLIB_HEADER);
+  if (wyszlo != surowy_b) {
+    ESP_LOGW(TAG, "PNG: rozpakowanie dalo %u B zamiast %u",
+             (unsigned) (wyszlo == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED ? 0 : wyszlo),
+             (unsigned) surowy_b);
+    heap_caps_free(surowy);
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+
+  // Odfiltrowanie w miejscu: kazdy wiersz odwoluje sie do sasiada z lewej
+  // i do wiersza wyzej, wiec idziemy od gory i nadpisujemy dane rozpakowane.
+  for (uint32_t y = 0; y < wys; y++) {
+    uint8_t *w = surowy + (size_t) y * (wiersz_b + 1);
+    const uint8_t filtr = w[0];
+    uint8_t *biez = w + 1;
+    const uint8_t *gora = (y == 0) ? nullptr : surowy + (size_t)(y - 1) * (wiersz_b + 1) + 1;
+    for (size_t i = 0; i < wiersz_b; i++) {
+      const int a = (i >= (size_t) krok_filtra) ? biez[i - krok_filtra] : 0;
+      const int b = gora ? gora[i] : 0;
+      const int c = (gora && i >= (size_t) krok_filtra) ? gora[i - krok_filtra] : 0;
+      switch (filtr) {
+        case 1: biez[i] = (uint8_t)(biez[i] + a); break;
+        case 2: biez[i] = (uint8_t)(biez[i] + b); break;
+        case 3: biez[i] = (uint8_t)(biez[i] + ((a + b) >> 1)); break;
+        case 4: biez[i] = (uint8_t)(biez[i] + png_paeth(a, b, c)); break;
+        default: break;   // 0 = bez filtra
+      }
+    }
+  }
+
+  // Zejscie z rozmiarem, gdy obraz nie miesci sie w buforze posrednim.
+  // Bierzemy co n-ty piksel — reszte skalowania i tak zrobi PPA.
+  uint32_t krok = 1;
+  while (((size_t)((szer / krok + 15) & ~15u)) * (wys / krok) * 2 > this->dekod_rozmiar_)
+    krok++;
+  const uint32_t szer_c = szer / krok, wys_c = wys / krok;
+  const uint32_t wiersz_px = (szer_c + 15u) & ~15u;   // PPA lubi rowne wiersze
+  if (krok > 1)
+    ESP_LOGI(TAG, "PNG %ux%u nie miesci sie w buforze — biore co %u piksel (%ux%u)",
+             (unsigned) szer, (unsigned) wys, (unsigned) krok,
+             (unsigned) szer_c, (unsigned) wys_c);
+
+  // Konwersja na BGR565 (w takiej kolejnosci pracuje LVGL na tym ekranie).
+  // Alfa nakladamy na czern — tlo kafla i tak jest ciemne.
+  uint16_t *cel = reinterpret_cast<uint16_t *>(this->dekod_buf_);
+  for (uint32_t y = 0; y < wys_c; y++) {
+    const uint8_t *zr = surowy + (size_t)(y * krok) * (wiersz_b + 1) + 1;
+    uint16_t *wy = cel + (size_t) y * wiersz_px;
+    for (uint32_t x = 0; x < szer_c; x++) {
+      const uint32_t xz = x * krok;
+      uint8_t pr[4] = {0, 0, 0, 255};   // probki, juz rozwiniete do 8 bitow
+      if (glebia == 8) {
+        const uint8_t *p = zr + (size_t) xz * kanaly;
+        for (int k = 0; k < kanaly; k++) pr[k] = p[k];
+      } else if (glebia == 16) {
+        const uint8_t *p = zr + (size_t) xz * kanaly * 2;
+        for (int k = 0; k < kanaly; k++) pr[k] = p[k * 2];   // starszy bajt
+      } else {
+        // Upakowane probki: glebia 1, 2 lub 4 bity, zawsze jeden kanal.
+        const uint32_t na_bajt = 8u / glebia;
+        const uint8_t bajt = zr[xz / na_bajt];
+        const uint32_t nr = xz % na_bajt;
+        const uint32_t przes = 8u - glebia * (nr + 1);
+        const uint32_t maska = (1u << glebia) - 1u;
+        const uint32_t v = (bajt >> przes) & maska;
+        // dla szarosci rozciagamy do pelnej skali, dla palety to numer koloru
+        pr[0] = (typ == 3) ? (uint8_t) v : (uint8_t)(v * 255u / maska);
+      }
+      uint8_t r, g, b, alfa = 255;
+      switch (typ) {
+        case 0: r = g = b = pr[0]; break;
+        case 4: r = g = b = pr[0]; alfa = pr[1]; break;
+        case 2: r = pr[0]; g = pr[1]; b = pr[2]; break;
+        case 6: r = pr[0]; g = pr[1]; b = pr[2]; alfa = pr[3]; break;
+        default: {                       // paleta
+          const uint8_t *k = paleta + (size_t) pr[0] * 3;
+          r = k[0]; g = k[1]; b = k[2];
+          break;
+        }
+      }
+      if (alfa != 255) {
+        r = (uint8_t)((r * alfa) / 255);
+        g = (uint8_t)((g * alfa) / 255);
+        b = (uint8_t)((b * alfa) / 255);
+      }
+      wy[x] = (uint16_t)(((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3));
+    }
+    for (uint32_t x = szer_c; x < wiersz_px; x++)
+      wy[x] = 0;
+  }
+  heap_caps_free(surowy);
+
+  // PPA czyta bufor przez DMA, a my pisalismy do niego procesorem — bez
+  // zapisu cache'u do pamieci sterownik zobaczylby stare dane.
+  const size_t uzyte = (size_t) wiersz_px * wys_c * 2;
+  esp_cache_msync(this->dekod_buf_, uzyte,
+                  ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+  return this->skaluj_i_odslon(szer_c, wys_c, wiersz_px, wys_c);
+}
+
 // Wolane z zadania strumienia — dekodowanie nie moze isc w glownej petli.
 bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   // Sprzetowy dekoder P4 obsluguje wylacznie JPEG. Czesc stacji radiowych
@@ -126,6 +364,8 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
       format = "GIF";
     else if (dlugosc >= 12 && b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P')
       format = "WEBP";
+    if (format[0] == 'P')                 // PNG ma wlasna, programowa sciezke
+      return this->dekoduj_png(dlugosc);
     ESP_LOGW(TAG, "Obraz nie jest JPEG (%s, %u B, pierwsze bajty %02X %02X %02X %02X)",
              format, (unsigned) dlugosc, b[0], b[1], b[2], b[3]);
     this->blad_formatu_ = true;
@@ -216,15 +456,24 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
     return false;
   }
 
+  return this->skaluj_i_odslon(info.width, info.height, szer_wyr, wys_wyr);
+}
+
+// Wspolne zakonczenie obu sciezek dekodowania: skalowanie sprzetowe do
+// rozmiaru docelowego i odsloniecie bufora. `szer`/`wys` to rzeczywisty obraz,
+// `wiersz_px`/`wys_zrodla` to wymiary bufora zrodlowego (moga byc wieksze,
+// bo dekoder JPEG wyrownuje do bloku MCU, a sciezka PNG do 16 pikseli).
+bool MjpegLvgl::skaluj_i_odslon(uint32_t szer, uint32_t wys, uint32_t wiersz_px,
+                                uint32_t wys_zrodla) {
   // Skalowanie sprzetowe do rozmiaru docelowego. LVGL dostaje obraz gotowy,
   // dzieki czemu nie uruchamia swojego programowego przeksztalcenia — to ono
   // kosztowalo 200-400 ms na kazde narysowanie okladki.
   ppa_srm_oper_config_t srm = {};
   srm.in.buffer = this->dekod_buf_;
-  srm.in.pic_w = szer_wyr;
-  srm.in.pic_h = wys_wyr;
-  srm.in.block_w = info.width;
-  srm.in.block_h = info.height;
+  srm.in.pic_w = wiersz_px;
+  srm.in.pic_h = wys_zrodla;
+  srm.in.block_w = szer;
+  srm.in.block_h = wys;
   srm.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
   srm.out.buffer = this->rgb_[this->wypelniany_];
   srm.out.buffer_size = this->rgb_rozmiar_;
@@ -236,8 +485,8 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   // ksztaltu bufora — kamera 4:3 wcisnieta w kafel 3:4 wygladala jak odbicie
   // w krzywym lustrze. Bierzemy mniejsza z dwoch skal, wiec caly obraz sie
   // miesci i zachowuje proporcje.
-  const float skala = std::min(static_cast<float>(this->width_) / info.width,
-                               static_cast<float>(this->height_) / info.height);
+  const float skala = std::min(static_cast<float>(this->width_) / szer,
+                               static_cast<float>(this->height_) / wys);
   srm.scale_x = skala;
   srm.scale_y = skala;
   srm.mode = PPA_TRANS_MODE_BLOCKING;
@@ -255,8 +504,8 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   const uint32_t sx_f = (uint32_t) (srm.scale_x * 16) & 15u;
   const uint32_t sy_i = (uint32_t) srm.scale_y;
   const uint32_t sy_f = (uint32_t) (srm.scale_y * 16) & 15u;
-  const uint32_t wy_w = sx_i * info.width + sx_f * info.width / 16;
-  const uint32_t wy_h = sy_i * info.height + sy_f * info.height / 16;
+  const uint32_t wy_w = sx_i * szer + sx_f * szer / 16;
+  const uint32_t wy_h = sy_i * wys + sy_f * wys / 16;
   if (wy_w == 0 || wy_h == 0) {
     ESP_LOGW(TAG, "Skalowanie dalo pusty obraz (%ux%u)", (unsigned) wy_w, (unsigned) wy_h);
     this->bledow_.fetch_add(1);
@@ -272,8 +521,8 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   esp_err_t blad_ppa = ppa_do_scale_rotate_mirror(this->ppa_, &srm);
   if (blad_ppa != ESP_OK) {
     ESP_LOGW(TAG, "Skalowanie PPA nieudane, skala %.3f, %s", (double) srm.scale_x, esp_err_to_name(blad_ppa));
-    ESP_LOGW(TAG, "  (%ux%u -> %ux%u)", (unsigned) info.width,
-             (unsigned) info.height, (unsigned) wy_w, (unsigned) wy_h);
+    ESP_LOGW(TAG, "  (%ux%u -> %ux%u)", (unsigned) szer,
+             (unsigned) wys, (unsigned) wy_w, (unsigned) wy_h);
     this->bledow_.fetch_add(1);
     return false;
   }
@@ -285,10 +534,10 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   k.wys = wy_h;
   k.wiersz_b = stride_px * 2;
   k.rozmiar = stride_px * wy_h * 2;
-  if (this->zdekodowanych_.load() == 0 || szer_wyr != this->ost_szer_) {
-    ESP_LOGI(TAG, "Obraz %ux%u -> %ux%u (blok %ux%u)", (unsigned) info.width,
-             (unsigned) info.height, (unsigned) wy_w, (unsigned) wy_h, mcu_w, mcu_h);
-    this->ost_szer_ = szer_wyr;
+  if (this->zdekodowanych_.load() == 0 || wiersz_px != this->ost_szer_) {
+    ESP_LOGI(TAG, "Obraz %ux%u -> %ux%u", (unsigned) szer, (unsigned) wys,
+             (unsigned) wy_w, (unsigned) wy_h);
+    this->ost_szer_ = wiersz_px;
   }
   // Odslon wypelniony bufor i przelacz sie na drugi.
   this->gotowy_.store(this->wypelniany_);

@@ -77,6 +77,9 @@ class MjpegLvgl : public Component {
 
   bool przygotuj_dekoder();
   bool dekoduj(uint32_t dlugosc);
+  // Programowa sciezka dla PNG — sprzetowy dekoder zna tylko JPEG.
+  bool dekoduj_png(uint32_t dlugosc);
+  bool skaluj_i_odslon(uint32_t szer, uint32_t wys, uint32_t wiersz_px, uint32_t wys_zrodla);
   bool pobierz_jeden(const std::string &url);
 
   uint8_t *jpeg_buf_{nullptr};       // surowa ramka JPEG (PSRAM)
