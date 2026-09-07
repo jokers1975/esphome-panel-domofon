@@ -4,6 +4,7 @@
 #include "esphome/core/log.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
+#include "esp_cache.h"
 #include "driver/jpeg_decode.h"
 #include "driver/ppa.h"
 #include "freertos/FreeRTOS.h"
@@ -227,8 +228,16 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
   const uint32_t wy_h = sy_i * info.height + sy_f * info.height / 16;
   if (wy_w < this->width_ || wy_h < this->height_) {
     memset(this->rgb_[this->wypelniany_], 0, this->rgb_rozmiar_);
-    ESP_LOGI(TAG, "Obraz wypelni %ux%u z %ux%u — czyszcze bufor przed skalowaniem",
-             (unsigned) wy_w, (unsigned) wy_h, this->width_, this->height_);
+    // Samo memset NIE wystarcza. Bufor lezy w pamieci obslugiwanej przez cache,
+    // wiec zera trafiaja najpierw tam. PPA zapisuje przez DMA prosto do pamieci
+    // i na koniec UNIEWAZNIA ten obszar cache'u, zeby procesor zobaczyl swieze
+    // dane — a unieważnienie odrzuca brudne linie, czyli moje zera. W marginesie
+    // zostawala wtedy poprzednia okladka, mimo ze log mowil o czyszczeniu.
+    // Wymuszamy zapis cache'u do pamieci PRZED operacja DMA.
+    esp_err_t bc = esp_cache_msync(this->rgb_[this->wypelniany_], this->rgb_rozmiar_,
+                                   ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    ESP_LOGI(TAG, "Obraz wypelni %ux%u z %ux%u — czyszcze bufor (zapis cache: %s)",
+             (unsigned) wy_w, (unsigned) wy_h, this->width_, this->height_, esp_err_to_name(bc));
   }
   esp_err_t blad_ppa = ppa_do_scale_rotate_mirror(this->ppa_, &srm);
   if (blad_ppa != ESP_OK) {
