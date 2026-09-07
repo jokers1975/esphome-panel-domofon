@@ -180,7 +180,8 @@ bool MjpegLvgl::dekoduj_png(uint32_t dlugosc) {
   }
 
   // Przejscie po blokach: sklejamy IDAT i zapamietujemy palete.
-  uint8_t paleta[256 * 3] = {};
+  static uint8_t paleta[256 * 3];   // 768 B: poza stosem, zadanie ma go malo
+  memset(paleta, 0, sizeof(paleta));
   uint32_t poz = 8, dl_idat = 0;
   const uint8_t *idat_pocz = nullptr;
   bool ciagle = true;      // czy bloki IDAT leza obok siebie
@@ -247,12 +248,30 @@ bool MjpegLvgl::dekoduj_png(uint32_t dlugosc) {
     this->bledow_.fetch_add(1);
     return false;
   }
-  const size_t wyszlo = tinfl_decompress_mem_to_mem(
-      surowy, surowy_b, idat_pocz, dl_idat, TINFL_FLAG_PARSE_ZLIB_HEADER);
-  if (wyszlo != surowy_b) {
-    ESP_LOGW(TAG, "PNG: rozpakowanie dalo %u B zamiast %u",
-             (unsigned) (wyszlo == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED ? 0 : wyszlo),
-             (unsigned) surowy_b);
+  // UWAGA: tinfl_decompress_mem_to_mem trzyma strukture dekompresora NA STOSIE,
+  // a ta ma ok. 11 kB (trzy tablice Huffmana po 3488 B). Zadanie dekodujace ma
+  // stos 12 kB — kazde dekodowanie PNG konczylo sie jego rozwaleniem
+  // i restartem panelu. Dlatego bierzemy niskopoziomowe tinfl_decompress
+  // i sami przydzielamy dekompresor na stercie.
+  tinfl_decompressor *dek = static_cast<tinfl_decompressor *>(
+      heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (dek == nullptr)
+    dek = static_cast<tinfl_decompressor *>(heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_8BIT));
+  if (dek == nullptr) {
+    ESP_LOGW(TAG, "PNG: brak %u B na dekompresor", (unsigned) sizeof(tinfl_decompressor));
+    heap_caps_free(surowy);
+    this->bledow_.fetch_add(1);
+    return false;
+  }
+  tinfl_init(dek);
+  size_t we_b = dl_idat, wyszlo = surowy_b;
+  const tinfl_status stan =
+      tinfl_decompress(dek, idat_pocz, &we_b, surowy, surowy, &wyszlo,
+                       TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+  heap_caps_free(dek);
+  if (stan != TINFL_STATUS_DONE || wyszlo != surowy_b) {
+    ESP_LOGW(TAG, "PNG: rozpakowanie zwrocilo %d, dalo %u B zamiast %u",
+             (int) stan, (unsigned) wyszlo, (unsigned) surowy_b);
     heap_caps_free(surowy);
     this->bledow_.fetch_add(1);
     return false;
