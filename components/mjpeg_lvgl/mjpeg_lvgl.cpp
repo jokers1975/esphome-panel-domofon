@@ -141,6 +141,42 @@ bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
     return false;
   }
 
+  // Sprzetowy dekoder P4 odrzuca obrazy o wymiarach niepodzielnych przez 8:
+  //   "Picture sizes not divisible by 8 are not supported" -> ESP_ERR_NOT_SUPPORTED.
+  // Trafialy na to logo stacji TuneIn (145x145), podczas gdy okladki albumow
+  // (512, 640) przechodzily. Obraz jest jednak ZAKODOWANY w pelnych blokach MCU,
+  // czyli fizycznie jako 160x160 — koder dopelnia ostatni blok. Dane sa w
+  // strumieniu, klamie tylko naglowek. Podnosimy wiec w naglowku SOF wymiary do
+  // wielokrotnosci bloku, a przy skalowaniu PPA i tak wycinamy obszar o
+  // rzeczywistych wymiarach (in.block_w/h), wiec dopelnienie nie trafia na ekran.
+  if ((info.width % 8) != 0 || (info.height % 8) != 0) {
+    size_t k = 2;
+    bool zmieniono = false;
+    while (k + 9 < dlugosc) {
+      if (this->jpeg_buf_[k] != 0xFF) { k++; continue; }
+      const uint8_t zn = this->jpeg_buf_[k + 1];
+      if (zn == 0xC0 || zn == 0xC1 || zn == 0xC2) {
+        this->jpeg_buf_[k + 5] = (uint8_t) (wys_wyr >> 8);
+        this->jpeg_buf_[k + 6] = (uint8_t) (wys_wyr & 0xFF);
+        this->jpeg_buf_[k + 7] = (uint8_t) (szer_wyr >> 8);
+        this->jpeg_buf_[k + 8] = (uint8_t) (szer_wyr & 0xFF);
+        zmieniono = true;
+        break;
+      }
+      if (zn == 0xDA || zn == 0xD9) break;             // dalej sa juz dane
+      if (zn == 0x01 || (zn >= 0xD0 && zn <= 0xD7)) { k += 2; continue; }
+      k += 2 + ((this->jpeg_buf_[k + 2] << 8) | this->jpeg_buf_[k + 3]);
+    }
+    if (!zmieniono) {
+      ESP_LOGW(TAG, "Nie znaleziono naglowka SOF do korekty rozmiaru %ux%u",
+               (unsigned) info.width, (unsigned) info.height);
+      this->bledow_.fetch_add(1);
+      return false;
+    }
+    ESP_LOGI(TAG, "Rozmiar %ux%u niepodzielny przez 8 — dekoduje jako %ux%u, wycinam do oryginalu",
+             (unsigned) info.width, (unsigned) info.height, (unsigned) szer_wyr, (unsigned) wys_wyr);
+  }
+
   jpeg_decode_cfg_t cfg = {};
   cfg.output_format = JPEG_DECODE_OUT_FORMAT_RGB565;
   cfg.rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR;   // LVGL pracuje na BGR565
