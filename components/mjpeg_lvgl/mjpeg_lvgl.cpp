@@ -376,7 +376,10 @@ void MjpegLvgl::start_stream() {
   this->task_handle_.store(uchwyt);
 }
 
-void MjpegLvgl::stop_stream() { this->biegnie_.store(false); }
+void MjpegLvgl::stop_stream() {
+  this->biegnie_.store(false);
+  this->wstrzymane_.store(false);
+}
 
 void MjpegLvgl::przelacz_strumien(const std::string &url) {
   if (url.empty() || url == this->url_)
@@ -496,7 +499,8 @@ bool MjpegLvgl::czytaj_strumien() {
           // Klatki ponad limit odrzucamy zaraz po zlozeniu, bez dekodowania.
           const uint32_t teraz_ms = millis();
           const uint32_t odstep = this->fps_ > 0 ? 1000u / this->fps_ : 0u;
-          if (odstep == 0 || teraz_ms - this->ost_dekod_ms_ >= odstep) {
+          if (!this->wstrzymane_.load() &&
+              (odstep == 0 || teraz_ms - this->ost_dekod_ms_ >= odstep)) {
             this->ost_dekod_ms_ = teraz_ms;
             const int64_t t0 = esp_timer_get_time();
             this->dekoduj(dl);

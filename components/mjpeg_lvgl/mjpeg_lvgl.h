@@ -38,6 +38,13 @@ class MjpegLvgl : public Component {
   // stare zadanie faktycznie sie zakonczy — inaczej dwa zadania pisalyby
   // do tych samych buforow.
   void przelacz_strumien(const std::string &url);
+  // Wstrzymanie DEKODOWANIA bez rozlaczania strumienia. Polaczenie zostaje
+  // otwarte, wiec go2rtc trzyma proces ffmpega przy zyciu i po powrocie na
+  // ekran obraz jest natychmiast, zamiast po kilku sekundach rozruchu.
+  // Klatki sa nadal odbierane i skladane, ale ida do kosza bez dekodowania.
+  void wstrzymaj(bool tak) { this->wstrzymane_.store(tak); }
+  bool wstrzymane() const { return this->wstrzymane_.load(); }
+
   // Tryb pojedynczych obrazow: zleca pobranie i zdekodowanie jednego JPEG.
   void pobierz(const std::string &url);
 
@@ -97,6 +104,7 @@ class MjpegLvgl : public Component {
   // zeruje uchwyt na wyjsciu — stad atomowy dostep zamiast zwyklego wskaznika.
   std::atomic<void *> task_handle_{nullptr};
   std::atomic<bool> biegnie_{false};
+  std::atomic<bool> wstrzymane_{false};
   std::atomic<uint32_t> ramek_{0};   // licznik odebranych ramek
   std::atomic<uint32_t> bledow_{0};
   std::atomic<uint32_t> ostatnia_dl_{0};  // rozmiar ostatniej ramki
