@@ -55,9 +55,10 @@ void MjpegLvgl::setup() {
   if (!this->tryb_strumienia_) {
     this->kolejka_ = xQueueCreate(1, sizeof(std::string *));
     this->biegnie_.store(true);
+    TaskHandle_t uchwyt = nullptr;
     xTaskCreatePinnedToCore(MjpegLvgl::task_trampoline, "jpeg1", 12288, this,
-                            tskIDLE_PRIORITY + 2,
-                            reinterpret_cast<TaskHandle_t *>(&this->task_handle_), 1);
+                            tskIDLE_PRIORITY + 2, &uchwyt, 1);
+    this->task_handle_.store(uchwyt);
     ESP_LOGCONFIG(TAG, "Tryb pojedynczych obrazow");
   }
 }
@@ -342,21 +343,32 @@ void MjpegLvgl::dump_config() {
 void MjpegLvgl::start_stream() {
   if (this->biegnie_.load())
     return;
+  // Poprzednie zadanie moze jeszcze konczyc odczyt (np. tuz po przelaczeniu
+  // kamery). Drugie zadanie pisaloby wtedy do tych samych buforow i obraz
+  // rozpadalby sie na kawalki. Zamiast tworzyc je teraz, zostawiamy zlecenie
+  // dla loop(), ktory wznowi strumien, gdy uchwyt zniknie.
+  if (this->task_handle_.load() != nullptr) {
+    if (this->url_oczekujacy_.empty())
+      this->url_oczekujacy_ = this->url_;
+    return;
+  }
   this->biegnie_.store(true);
   this->ramek_.store(0);
   this->bledow_.store(0);
   // Wlasne zadanie: pobieranie nie moze blokowac glownej petli, bo to
   // wlasnie ono zawieszalo panel przy okladkach.
+  TaskHandle_t uchwyt = nullptr;
   xTaskCreatePinnedToCore(MjpegLvgl::task_trampoline, "mjpeg", 12288, this,
                           tskIDLE_PRIORITY + 2,
-                          reinterpret_cast<TaskHandle_t *>(&this->task_handle_), 1);
+                          &uchwyt, 1);
+  this->task_handle_.store(uchwyt);
 }
 
 void MjpegLvgl::stop_stream() { this->biegnie_.store(false); }
 
 void MjpegLvgl::przelacz_strumien(const std::string &url) {
   if (url.empty() || url == this->url_)
-    return;
+    return;   // ta sama kamera — nie przerywamy leciacego obrazu
   ESP_LOGI(TAG, "Przelaczam strumien na: %s", url.c_str());
   this->url_oczekujacy_ = url;
   this->biegnie_.store(false);   // zadanie wyjdzie po zakonczeniu biezacego odczytu
@@ -400,7 +412,7 @@ void MjpegLvgl::task_loop() {
     if (!this->czytaj_strumien())
       vTaskDelay(pdMS_TO_TICKS(1000));   // po bledzie odczekaj przed ponowieniem
   }
-  this->task_handle_ = nullptr;
+  this->task_handle_.store(nullptr);
 }
 
 // Rozbior odpowiedzi multipart/x-mixed-replace: szukamy znacznikow SOI (FFD8)
@@ -481,7 +493,7 @@ void MjpegLvgl::loop() {
   // Wznowienie po przelaczeniu kamery. Czekamy, az stare zadanie sie zakonczy
   // (task_loop zeruje uchwyt na wyjsciu), zeby nie mialy dwa zadania naraz
   // dostepu do dekodera i buforow.
-  if (!this->url_oczekujacy_.empty() && this->task_handle_ == nullptr) {
+  if (!this->url_oczekujacy_.empty() && this->task_handle_.load() == nullptr) {
     this->url_ = this->url_oczekujacy_;
     this->url_oczekujacy_.clear();
     this->start_stream();
@@ -499,9 +511,9 @@ void MjpegLvgl::loop() {
     // lokalnej 2048 B lancuch HTTP + dekoder + PPA podchodzil pod wartownika,
     // a przepelnienie objawialo sie niebieskim ekranem i restartem. Ta liczba
     // to najmniejszy zaobserwowany wolny zapas w bajtach — ma zostac wysoko.
-    if (this->task_handle_ != nullptr) {
+    if (this->task_handle_.load() != nullptr) {
       const UBaseType_t zapas =
-          uxTaskGetStackHighWaterMark(reinterpret_cast<TaskHandle_t>(this->task_handle_));
+          uxTaskGetStackHighWaterMark(static_cast<TaskHandle_t>(this->task_handle_.load()));
       ESP_LOGI(TAG, "zapas stosu zadania: %u B", (unsigned) (zapas * sizeof(StackType_t)));
     }
     this->poprzednio_ = n;

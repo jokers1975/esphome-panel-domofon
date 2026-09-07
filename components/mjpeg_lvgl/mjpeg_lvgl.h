@@ -82,7 +82,9 @@ class MjpegLvgl : public Component {
   lv_image_dsc_t opis_{};
   std::atomic<uint32_t> zdekodowanych_{0};
   uint32_t ost_szer_{0};   // ostatnia wyrownana szerokosc — do logu przy zmianie
-  void *task_handle_{nullptr};
+  // Czytany takze z glownej petli (loop) w chwili, gdy zadanie sam sobie
+  // zeruje uchwyt na wyjsciu — stad atomowy dostep zamiast zwyklego wskaznika.
+  std::atomic<void *> task_handle_{nullptr};
   std::atomic<bool> biegnie_{false};
   std::atomic<uint32_t> ramek_{0};   // licznik odebranych ramek
   std::atomic<uint32_t> bledow_{0};
