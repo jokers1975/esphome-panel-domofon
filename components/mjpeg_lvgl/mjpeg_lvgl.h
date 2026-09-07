@@ -109,6 +109,9 @@ class MjpegLvgl : public Component {
   Ksztalt ksztalt_[2];
   std::atomic<uint32_t> zdekodowanych_{0};
   std::atomic<uint32_t> us_dekod_{0};   // suma czasu dekodowania w oknie pomiaru
+  // Obraz w formacie, ktorego sprzetowy dekoder nie zna (np. PNG). Ponawianie
+  // pobrania nic tu nie da — plik bedzie taki sam.
+  bool blad_formatu_{false};
   uint32_t ost_dekod_ms_{0};           // kiedy ostatnio dekodowalismy klatke
   float fps_ost_{0.0f};
   float obc_ost_{0.0f};

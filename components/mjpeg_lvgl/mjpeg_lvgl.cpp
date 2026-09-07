@@ -113,6 +113,25 @@ bool MjpegLvgl::przygotuj_dekoder() {
 
 // Wolane z zadania strumienia — dekodowanie nie moze isc w glownej petli.
 bool MjpegLvgl::dekoduj(uint32_t dlugosc) {
+  // Sprzetowy dekoder P4 obsluguje wylacznie JPEG. Czesc stacji radiowych
+  // podaje okladki jako PNG — bez tego sprawdzenia dekoder brnal przez dane
+  // PNG, bral przypadkowe bajty za znaczniki i sypal w log bledami
+  // "Truncated/invalid segment for marker 0xff69".
+  if (dlugosc < 4 || this->jpeg_buf_[0] != 0xFF || this->jpeg_buf_[1] != 0xD8) {
+    const uint8_t *b = this->jpeg_buf_;
+    const char *format = "nieznany";
+    if (dlugosc >= 8 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G')
+      format = "PNG";
+    else if (dlugosc >= 6 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F')
+      format = "GIF";
+    else if (dlugosc >= 12 && b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P')
+      format = "WEBP";
+    ESP_LOGW(TAG, "Obraz nie jest JPEG (%s, %u B, pierwsze bajty %02X %02X %02X %02X)",
+             format, (unsigned) dlugosc, b[0], b[1], b[2], b[3]);
+    this->blad_formatu_ = true;
+    this->bledow_.fetch_add(1);
+    return false;
+  }
   // Okladki plyt przychodza w roznych rozmiarach, wiec wymiary czytamy
   // z naglowka kazdej ramki zamiast ufac konfiguracji.
   jpeg_decode_picture_info_t info = {};
@@ -424,7 +443,8 @@ void MjpegLvgl::task_loop() {
         // Wynik nie moze byc odrzucany — probujemy ponownie z narastajaca przerwa.
         static const uint16_t przerwy[] = {400, 1200, 3000};
         bool ok = false;
-        for (int proba = 0; proba < 4 && !ok; proba++) {
+        this->blad_formatu_ = false;
+        for (int proba = 0; proba < 4 && !ok && !this->blad_formatu_; proba++) {
           if (proba > 0) {
             // Nowsze zlecenie uniewaznia ponawianie — nie nadpisujmy go stara okladka.
             if (uxQueueMessagesWaiting(this->kolejka_) > 0)
@@ -435,6 +455,8 @@ void MjpegLvgl::task_loop() {
         }
         if (ok) {
           this->ostatni_ok_ = *url;
+        } else if (this->blad_formatu_) {
+          ESP_LOGW(TAG, "Okladka w formacie nie do odczytania — pomijam: %s", url->c_str());
         } else {
           ESP_LOGW(TAG, "Nie udalo sie pobrac okladki po 4 probach: %s", url->c_str());
         }
