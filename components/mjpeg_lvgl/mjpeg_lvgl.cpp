@@ -354,6 +354,14 @@ void MjpegLvgl::start_stream() {
 
 void MjpegLvgl::stop_stream() { this->biegnie_.store(false); }
 
+void MjpegLvgl::przelacz_strumien(const std::string &url) {
+  if (url.empty() || url == this->url_)
+    return;
+  ESP_LOGI(TAG, "Przelaczam strumien na: %s", url.c_str());
+  this->url_oczekujacy_ = url;
+  this->biegnie_.store(false);   // zadanie wyjdzie po zakonczeniu biezacego odczytu
+}
+
 void MjpegLvgl::task_trampoline(void *arg) {
   static_cast<MjpegLvgl *>(arg)->task_loop();
   vTaskDelete(nullptr);
@@ -470,6 +478,15 @@ bool MjpegLvgl::czytaj_strumien() {
 }
 
 void MjpegLvgl::loop() {
+  // Wznowienie po przelaczeniu kamery. Czekamy, az stare zadanie sie zakonczy
+  // (task_loop zeruje uchwyt na wyjsciu), zeby nie mialy dwa zadania naraz
+  // dostepu do dekodera i buforow.
+  if (!this->url_oczekujacy_.empty() && this->task_handle_ == nullptr) {
+    this->url_ = this->url_oczekujacy_;
+    this->url_oczekujacy_.clear();
+    this->start_stream();
+  }
+
   // Raport co 5 s, na razie tylko licznik ramek — dowod, ze rozbior dziala.
   const uint32_t teraz = millis();
   if (this->biegnie_.load() && teraz - this->ostatni_raport_ > 5000) {

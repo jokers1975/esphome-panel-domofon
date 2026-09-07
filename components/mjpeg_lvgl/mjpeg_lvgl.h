@@ -33,6 +33,11 @@ class MjpegLvgl : public Component {
 
   void start_stream();
   void stop_stream();
+  // Przelaczenie na inna kamere bez tworzenia drugiej instancji. Zatrzymuje
+  // biezace zadanie i zapamietuje nowy adres; wznowienie robi loop(), gdy
+  // stare zadanie faktycznie sie zakonczy — inaczej dwa zadania pisalyby
+  // do tych samych buforow.
+  void przelacz_strumien(const std::string &url);
   // Tryb pojedynczych obrazow: zleca pobranie i zdekodowanie jednego JPEG.
   void pobierz(const std::string &url);
 
@@ -50,6 +55,7 @@ class MjpegLvgl : public Component {
   bool czytaj_strumien();
 
   std::string url_;
+  std::string url_oczekujacy_;
   uint16_t width_{0};
   uint16_t height_{0};
   uint8_t fps_{10};
